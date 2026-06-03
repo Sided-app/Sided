@@ -1,0 +1,15 @@
+# Optional: only needed if your host sleeps on the free tier.
+# It pings the sync endpoint, which both refreshes fixtures and wakes the server.
+# In your repo: Settings → Secrets and variables → Actions, add:
+#   API_URL      = your deployed backend URL (e.g. https://sided-api.onrender.com)
+#   CRON_SECRET  = the CRON_SECRET value Render generated
+name: Sided sync (football-data, every 10 min)
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # big leagues + World Cup, near-live scores
+  workflow_dispatch:
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsS "${{ secrets.API_URL }}/api/sync?key=${{ secrets.CRON_SECRET }}&src=fd"

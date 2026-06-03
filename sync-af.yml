@@ -1,0 +1,13 @@
+# API-Football leagues (Saudi, MLS, Liga MX, Liga Argentina, Jupiler) every 2 hours.
+# 5 leagues × 12 runs/day = 60 calls/day — safely under the free 100/day cap.
+# Uses the same repo secrets: API_URL and CRON_SECRET.
+name: Sided sync (API-Football, every 2 hours)
+on:
+  schedule:
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+jobs:
+  sync-af:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsS "${{ secrets.API_URL }}/api/sync?key=${{ secrets.CRON_SECRET }}&src=af"
