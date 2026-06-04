@@ -17,7 +17,7 @@ const {
 } = process.env;
 
 const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-const stripe = new Stripe(STRIPE_SECRET);
+const stripe = STRIPE_SECRET ? new Stripe(STRIPE_SECRET) : null;
 const app = express();
 app.use(cors({ origin: APP_URL ? APP_URL.split(',') : true }));
 // Stripe webhook needs the raw body — register before express.json()
@@ -271,6 +271,7 @@ async function settleFixture(fx) {
 
 // ════════ STRIPE PRO ════════
 app.post('/api/checkout', auth, async (req, res) => {
+  if (!stripe || !STRIPE_PRICE_ID) return res.status(503).json({ error: 'Payments are not set up yet.' });
   const { data: profile } = await db.from('profiles').select('stripe_customer_id').eq('id', req.userId).single();
   const session = await stripe.checkout.sessions.create({
     mode: 'subscription', line_items: [{ price: STRIPE_PRICE_ID, quantity: 1 }],
@@ -279,6 +280,7 @@ app.post('/api/checkout', auth, async (req, res) => {
   res.json({ url: session.url });
 });
 async function stripeWebhook(req, res) {
+  if (!stripe) return res.status(503).end();
   let event;
   try { event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET); }
   catch (e) { return res.status(400).send(`bad signature: ${e.message}`); }
