@@ -1,0 +1,38 @@
+## Render Blueprint for Sided's backend.
+## In Render: New → Blueprint → connect your repo. Render reads this file,
+## creates the service, and asks you to paste the secret values (the ones
+## marked "sync: false"). CRON_SECRET is generated automatically.
+
+services:
+  - type: web
+    name: sided-api
+    runtime: node
+    plan: free            # upgrade to "starter" ($7/mo) for an always-on instance
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: FOOTBALL_DATA_TOKEN
+        sync: false
+      - key: APIFOOTBALL_TOKEN
+        sync: false        # api-sports.io key (Saudi/MLS/Liga MX/Argentina/Belgium)
+      - key: AF_SEASON
+        value: "2026"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false        # ← your service_role key goes HERE, nowhere else
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+      - key: STRIPE_SECRET
+        sync: false        # can leave blank until you test payments
+      - key: STRIPE_PRICE_ID
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: APP_URL
+        sync: false        # your front-end URL (set after deploying index.html)
+      - key: CRON_SECRET
+        generateValue: true
+      - key: SELF_SYNC
+        value: "false"     # the GitHub Action does the syncing (and wakes the free server)
