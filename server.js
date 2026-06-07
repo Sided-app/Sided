@@ -92,7 +92,7 @@ app.get('/api/profile', auth, async (req, res) => {
 });
 app.post('/api/profile', auth, async (req, res) => {
   const username = clean(req.body.username, 20);
-  const avatar = Math.max(0, Math.min(74, parseInt(req.body.avatar) || 10));
+  const avatar = Math.max(0, Math.min(99, parseInt(req.body.avatar) || 10));
   const fav_team = req.body.fav_team ? clean(req.body.fav_team, 40) : null;
   if (!/^[A-Za-z0-9_]{3,20}$/.test(username)) return res.status(400).json({ error: 'Username must be 3–20 letters, numbers or underscores.' });
   const { error } = await db.from('profiles').upsert({ id: req.userId, username, avatar: Math.max(0,Math.min(54,+avatar||10)), fav_team });
