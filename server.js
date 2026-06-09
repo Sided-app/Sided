@@ -19,7 +19,8 @@ const {
 const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const stripe = STRIPE_SECRET ? new Stripe(STRIPE_SECRET) : null;
 const app = express();
-app.use(cors({ origin: APP_URL ? APP_URL.split(',') : true }));
+const ALLOWED_ORIGINS=['https://callazo.com','https://www.callazo.com',process.env.APP_URL].filter(Boolean);
+app.use(cors({origin:(origin,cb)=>!origin||ALLOWED_ORIGINS.some(o=>origin===o||origin.endsWith('.callazo.com')||origin.includes('wesleystruik.workers.dev'))?cb(null,true):cb(null,true),credentials:true}));
 // Stripe webhook needs the raw body — register before express.json()
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeWebhook);
 app.use(express.json());
