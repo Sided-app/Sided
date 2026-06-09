@@ -1,4 +1,4 @@
-// Sided — backend API (Node 18+ / Express)
+// Callazo — backend API (Node 18+ / Express)
 // npm i express @supabase/supabase-js stripe jsonwebtoken cors
 // Run: node server.js   (after setting the env vars listed at the bottom)
 
@@ -13,7 +13,7 @@ const {
   PORT = 3000, FOOTBALL_DATA_TOKEN,
   SUPABASE_URL, SUPABASE_SERVICE_KEY, SUPABASE_JWT_SECRET,
   STRIPE_SECRET, STRIPE_PRICE_ID, STRIPE_WEBHOOK_SECRET,
-  CRON_SECRET, APP_URL = 'https://sided.app',
+  CRON_SECRET, APP_URL = 'https://callazo.app',
 } = process.env;
 
 const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
@@ -510,7 +510,7 @@ async function stripeWebhook(req, res) {
   res.json({ received: true });
 }
 
-app.listen(PORT, () => console.log(`Sided API on :${PORT}`));
+app.listen(PORT, () => console.log(`Callazo API on :${PORT}`));
 
 // Self-scheduled sync — no external cron needed (set SELF_SYNC=false to disable,
 // e.g. if you prefer the GitHub Action when running on a free tier that sleeps).
