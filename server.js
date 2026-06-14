@@ -1,3 +1,13 @@
+import webpush from 'web-push';
+
+// ── Web Push VAPID ───────────────────────────────────────────────────────────
+const VAPID_PUBLIC=process.env.VAPID_PUBLIC_KEY||'';
+const VAPID_PRIVATE=process.env.VAPID_PRIVATE_KEY||'';
+if(VAPID_PUBLIC&&VAPID_PRIVATE){
+  webpush.setVapidDetails('mailto:hello@callazo.com',VAPID_PUBLIC,VAPID_PRIVATE);
+  console.log('Web Push VAPID configured');
+}
+
 // Callazo — backend API (Node 18+ / Express)
 // npm i express @supabase/supabase-js stripe jsonwebtoken cors
 // Run: node server.js   (after setting the env vars listed at the bottom)
@@ -479,12 +489,104 @@ async function settleFixture(fx) {
   if (!preds?.length) return 0;
   for (const p of preds) {
     let pts = 0;
-    if (p.pick === result) pts += 3;
+    const correct = p.pick === result;
+    if (correct) pts += 3;
     if (p.pred_home === fx.home_score && p.pred_away === fx.away_score) pts += 2;
-    await db.from('predictions').update({ points: pts, settled: true }).eq('id', p.id);
+    await db.from('predictions').update({
+      points: pts,
+      settled: true,
+      correct,
+      home_score: fx.home_score,
+      away_score: fx.away_score
+    }).eq('id', p.id);
   }
+  // Send push notifications
+  for (const p of preds) {
+    const correct = p.pick === result;
+    const pts = (correct ? 3 : 0) + (p.pred_home === fx.home_score && p.pred_away === fx.away_score ? 2 : 0);
+    const title = correct ? '✅ Correct call! +' + pts + 'pts' : '❌ Not this time';
+    const body = `${fx.home_team} ${fx.home_score}–${fx.away_score} ${fx.away_team}`;
+    sendPush(p.user_id, title, body, '/').catch(() => {});
+  }
+  console.log(`settled fixture ${fx.id} (${fx.home_team} vs ${fx.away_team}): ${preds.length} predictions`);
   return preds.length;
 }
+
+
+// ── Cron endpoint — call from UptimeRobot or external scheduler ─────────────
+app.get('/api/cron', async (req, res) => {
+  const secret = req.headers['x-cron-secret'] || req.query.secret;
+  if (secret !== process.env.CRON_SECRET) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const result = await runSync();
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('cron error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Re-settle all unsettled predictions (catch-up for missed cron runs) ──────
+app.post('/api/admin/resettle', async (req, res) => {
+  const secret = req.headers['x-cron-secret'] || req.body?.secret;
+  if (secret !== process.env.CRON_SECRET) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    // Get all unsettled predictions
+    const { data: unsettled } = await db
+      .from('predictions')
+      .select('fixture_id')
+      .eq('settled', false);
+    if (!unsettled?.length) return res.json({ ok: true, settled: 0, message: 'nothing to settle' });
+
+    const fxIds = [...new Set(unsettled.map(p => p.fixture_id))];
+    let settled = 0;
+    for (const fxId of fxIds) {
+      const { data: fx } = await db.from('fixtures').select('*').eq('id', fxId).single();
+      if (fx?.status === 'FINISHED' && fx.home_score != null) {
+        settled += await settleFixture(fx);
+      }
+    }
+    res.json({ ok: true, settled, checked: fxIds.length });
+  } catch (e) {
+    console.error('resettle error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+// ── Push subscription ────────────────────────────────────────────────────────
+app.post('/api/push-subscribe', authMw, async (req, res) => {
+  const { subscription } = req.body;
+  if (!subscription) return res.status(400).json({ error: 'no subscription' });
+  await db.from('push_subscriptions').upsert({
+    user_id: req.user.id,
+    subscription: JSON.stringify(subscription),
+    updated_at: new Date().toISOString()
+  }, { onConflict: 'user_id' });
+  res.json({ ok: true });
+});
+
+// ── Send push to a user ───────────────────────────────────────────────────────
+async function sendPush(userId, title, body, url='/') {
+  if (!VAPID_PUBLIC || !VAPID_PRIVATE) return;
+  try {
+    const { data } = await db.from('push_subscriptions').select('subscription').eq('user_id', userId).single();
+    if (!data?.subscription) return;
+    const sub = JSON.parse(data.subscription);
+    await webpush.sendNotification(sub, JSON.stringify({ title, body, url }));
+  } catch (e) {
+    if (e.statusCode === 410) {
+      // Subscription expired — remove it
+      await db.from('push_subscriptions').delete().eq('user_id', userId);
+    }
+    console.warn('Push send failed for', userId, e.message);
+  }
+}
+
+// ── VAPID public key endpoint (for frontend) ─────────────────────────────────
+app.get('/api/vapid-public', (req, res) => {
+  res.json({ key: VAPID_PUBLIC });
+});
 
 // ════════ STRIPE PRO ════════
 app.post('/api/checkout', auth, async (req, res) => {
