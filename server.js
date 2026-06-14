@@ -588,6 +588,146 @@ app.get('/api/vapid-public', (req, res) => {
   res.json({ key: VAPID_PUBLIC });
 });
 
+
+// ══════════════════════════════════════════════════════════
+// ── HEAD-TO-HEAD ──────────────────────────────────────────
+// ══════════════════════════════════════════════════════════
+app.get('/api/h2h', authMw, async (req, res) => {
+  const { user1, user2 } = req.query;
+  if (!user1 || !user2) return res.status(400).json({ error: 'need user1 and user2' });
+  try {
+    // Get both users' profiles
+    const { data: profiles } = await db.from('profiles')
+      .select('id,username,avatar,accuracy,points')
+      .in('id', [user1, user2]);
+    // Get predictions for both users on same fixtures
+    const { data: preds1 } = await db.from('predictions')
+      .select('fixture_id,pick,correct,points,pred_home,pred_away,home_score,away_score')
+      .eq('user_id', user1).eq('settled', true);
+    const { data: preds2 } = await db.from('predictions')
+      .select('fixture_id,pick,correct,points,pred_home,pred_away,home_score,away_score')
+      .eq('user_id', user2).eq('settled', true);
+    // Find shared fixtures
+    const p2map = new Map((preds2||[]).map(p => [p.fixture_id, p]));
+    const shared = (preds1||[]).filter(p => p2map.has(p.fixture_id)).map(p => ({
+      fid: p.fixture_id,
+      u1: { correct: p.correct, pts: p.points, pick: p.pick, ph: p.pred_home, pa: p.pred_away },
+      u2: (() => { const p2 = p2map.get(p.fixture_id); return { correct: p2.correct, pts: p2.points, pick: p2.pick, ph: p2.pred_home, pa: p2.pred_away }; })(),
+      score: `${p.home_score??'?'}-${p.away_score??'?'}`
+    }));
+    // Get fixture names for shared
+    const fids = shared.map(s => s.fid);
+    const { data: fixtures } = fids.length ? await db.from('fixtures').select('id,home_team,away_team,date').in('id', fids) : { data: [] };
+    const fmap = new Map((fixtures||[]).map(f => [f.id, f]));
+    const result = shared.map(s => ({ ...s, h: fmap.get(s.fid)?.home_team, a: fmap.get(s.fid)?.away_team, date: fmap.get(s.fid)?.date }));
+    res.json({ profiles: profiles||[], shared: result.sort((a,b)=>(b.date||'').localeCompare(a.date||'')) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════════════════════
+// ── PUBLIC LEAGUES ────────────────────────────────────────
+// ══════════════════════════════════════════════════════════
+app.get('/api/leagues/public', async (req, res) => {
+  try {
+    const { comp, team } = req.query;
+    let q = db.from('leagues').select('id,name,competition,emoji,team_filter,code,created_at,league_members(count)').eq('is_public', true);
+    if (comp) q = q.eq('competition', comp);
+    if (team) q = q.eq('team_filter', team);
+    const { data, error } = await q.order('created_at', { ascending: false }).limit(50);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json((data||[]).map(l => ({
+      id: l.id, name: l.name, comp: l.competition, emoji: l.emoji||'⚽',
+      team: l.team_filter, code: l.code,
+      members: l.league_members?.[0]?.count || 0
+    })));
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/leagues/make-public', authMw, async (req, res) => {
+  const { league_id, emoji, team_filter } = req.body;
+  const { data: lg } = await db.from('leagues').select('owner_id').eq('id', league_id).single();
+  if (lg?.owner_id !== req.user.id) return res.status(403).json({ error: 'not your league' });
+  await db.from('leagues').update({ is_public: true, emoji: emoji||'⚽', team_filter: team_filter||null }).eq('id', league_id);
+  res.json({ ok: true });
+});
+
+// ══════════════════════════════════════════════════════════
+// ── LEAGUE HISTORY / HALL OF FAME ─────────────────────────
+// ══════════════════════════════════════════════════════════
+app.get('/api/leagues/:id/history', authMw, async (req, res) => {
+  try {
+    const { data, error } = await db.from('league_history')
+      .select('*').eq('league_id', req.params.id).order('ended_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data||[]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/leagues/:id/close-season', authMw, async (req, res) => {
+  const { season_name } = req.body;
+  if (!season_name) return res.status(400).json({ error: 'season_name required' });
+  try {
+    const { data: lg } = await db.from('leagues').select('owner_id').eq('id', req.params.id).single();
+    if (lg?.owner_id !== req.user.id) return res.status(403).json({ error: 'not your league' });
+    // Get current standings
+    const { data: members } = await db.from('league_members')
+      .select('user_id,points,profiles(username,avatar)').eq('league_id', req.params.id)
+      .order('points', { ascending: false }).limit(1);
+    const winner = members?.[0];
+    const { count } = await db.from('league_members').select('*',{count:'exact',head:true}).eq('league_id',req.params.id);
+    await db.from('league_history').insert({
+      league_id: req.params.id, season_name,
+      winner_id: winner?.user_id, winner_name: winner?.profiles?.username,
+      winner_pts: winner?.points||0, total_members: count||0
+    });
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════════════════════
+// ── WEEKLY DIGEST ─────────────────────────────────────────
+// ══════════════════════════════════════════════════════════
+async function sendWeeklyDigest() {
+  if (!VAPID_PUBLIC || !VAPID_PRIVATE) return { sent: 0 };
+  const mon = new Date(); mon.setDate(mon.getDate() - ((mon.getDay() + 6) % 7)); mon.setHours(0,0,0,0);
+  const { data: preds } = await db.from('predictions')
+    .select('user_id,correct,points').eq('settled', true).gte('created_at', mon.toISOString());
+  const byUser = {};
+  (preds||[]).forEach(p => {
+    if (!byUser[p.user_id]) byUser[p.user_id] = { pts: 0, correct: 0, total: 0 };
+    byUser[p.user_id].pts += p.points||0;
+    byUser[p.user_id].total++;
+    if (p.correct) byUser[p.user_id].correct++;
+  });
+  const uids = Object.keys(byUser);
+  if (!uids.length) return { sent: 0 };
+  const { data: subs } = await db.from('push_subscriptions').select('user_id,subscription').in('user_id', uids);
+  let sent = 0;
+  for (const sub of (subs||[])) {
+    const s = byUser[sub.user_id];
+    if (!s) continue;
+    const title = `⚽ Week recap — ${s.pts}pts earned`;
+    const body = `${s.correct}/${s.total} correct calls this week. Keep it up!`;
+    try {
+      await webpush.sendNotification(JSON.parse(sub.subscription), JSON.stringify({ title, body, url: '/' }));
+      sent++;
+    } catch(e) {
+      if (e.statusCode === 410) await db.from('push_subscriptions').delete().eq('user_id', sub.user_id);
+    }
+  }
+  console.log(`Weekly digest sent to ${sent} users`);
+  return { sent };
+}
+
+// Hook into cron — send digest on Mondays
+const _origCron = app._router?.stack?.find?.(r=>r?.route?.path==='/api/cron');
+app.get('/api/digest', async (req, res) => {
+  const secret = req.headers['x-cron-secret'] || req.query.secret;
+  if (secret !== process.env.CRON_SECRET) return res.status(401).json({ error: 'unauthorized' });
+  const r = await sendWeeklyDigest();
+  res.json({ ok: true, ...r });
+});
+
 // ════════ STRIPE PRO ════════
 app.post('/api/checkout', auth, async (req, res) => {
   if (!stripe || !STRIPE_PRICE_ID) return res.status(503).json({ error: 'Payments are not set up yet.' });
