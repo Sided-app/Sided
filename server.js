@@ -1,17 +1,7 @@
-import webpush from 'web-push';
-
-// ── Web Push VAPID ───────────────────────────────────────────────────────────
-const VAPID_PUBLIC=process.env.VAPID_PUBLIC_KEY||'';
-const VAPID_PRIVATE=process.env.VAPID_PRIVATE_KEY||'';
-if(VAPID_PUBLIC&&VAPID_PRIVATE){
-  webpush.setVapidDetails('mailto:hello@callazo.com',VAPID_PUBLIC,VAPID_PRIVATE);
-  console.log('Web Push VAPID configured');
-}
-
-// Callazo — backend API (Node 18+ / Express)
-// npm i express @supabase/supabase-js stripe jsonwebtoken cors
-// Run: node server.js   (after setting the env vars listed at the bottom)
-
+// ═══════════════════════════════════════════════════════════════
+// CALLAZO V2 — Server (2026/27 season)
+// npm i express @supabase/supabase-js stripe jsonwebtoken cors express-rate-limit
+// ═══════════════════════════════════════════════════════════════
 import express from 'express';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
@@ -20,748 +10,540 @@ import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
 
 const {
-  PORT = 3000, FOOTBALL_DATA_TOKEN,
+  PORT = 3000,
+  FOOTBALL_DATA_TOKEN,
   SUPABASE_URL, SUPABASE_SERVICE_KEY, SUPABASE_JWT_SECRET,
   STRIPE_SECRET, STRIPE_PRICE_ID, STRIPE_WEBHOOK_SECRET,
-  CRON_SECRET, APP_URL = 'https://callazo.app',
+  CRON_SECRET,
+  APP_URL = 'https://callazo.com',
 } = process.env;
 
 const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const stripe = STRIPE_SECRET ? new Stripe(STRIPE_SECRET) : null;
 const app = express();
-const ALLOWED_ORIGINS=['https://callazo.com','https://www.callazo.com',process.env.APP_URL].filter(Boolean);
-app.use(cors({origin:(origin,cb)=>!origin||ALLOWED_ORIGINS.some(o=>origin===o||origin.endsWith('.callazo.com')||origin.includes('wesleystruik.workers.dev'))?cb(null,true):cb(null,true),credentials:true}));
-// Stripe webhook needs the raw body — register before express.json()
-app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeWebhook);
+
+// ── CORS ──────────────────────────────────────────────────────
+const ALLOWED = [APP_URL, 'https://callazo.com', 'https://www.callazo.com'].filter(Boolean);
+app.use(cors({ origin: (o, cb) => (!o || ALLOWED.some(a => o === a || o.includes('callazo.com'))) ? cb(null, true) : cb(null, true), credentials: true }));
+
+// ── Body parsing ──────────────────────────────────────────────
+app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
-app.set('trust proxy', 1); // correct client IPs behind Render's proxy
-// Rate limiting: a general cap, plus a tighter cap on writes (anti-spam/abuse).
-app.use('/api/', rateLimit({ windowMs: 60_000, max: 120 }));
-app.use(['/api/predictions','/api/diary','/api/comments','/api/follow','/api/team-follow','/api/leagues','/api/leagues/join','/api/report','/api/block','/api/profile','/api/reactions','/api/activity','/api/leaderboard','/api/users/search'],
-        rateLimit({ windowMs: 60_000, max: 25 }));
 
-// ── small validators ──
-const isInt0to99 = v => v == null || (Number.isInteger(+v) && +v >= 0 && +v <= 99);
-const clean = (s, n) => String(s ?? '').trim().slice(0, n);
+// ── Rate limiting ─────────────────────────────────────────────
+const rl = (max = 60) => rateLimit({ windowMs: 60_000, max });
 
-// ── competitions on football-data.org (others need API-Football) ──
-const COMP_MAP = { 'World Cup 2026':'WC','Premier League':'PL','La Liga':'PD','Bundesliga':'BL1','Serie A':'SA','Ligue 1':'FL1','Eredivisie':'DED','Champions League':'CL','Europa League':'EL','Conference League':'ECLC','Brasileirão':'BSA','Championship':'ELC' };
-const CODE2NAME = Object.fromEntries(Object.entries(COMP_MAP).map(([n,c]) => [c, n]));
+// ── Auth middleware ───────────────────────────────────────────
+const authMw = (req, res, next) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'no token' });
+  try {
+    const decoded = jwt.verify(token, SUPABASE_JWT_SECRET);
+    req.user = decoded;
+    req.userId = decoded.sub;
+    next();
+  } catch { res.status(401).json({ error: 'invalid token' }); }
+};
 
-async function fd(path) {
-  const res = await fetch(`https://api.football-data.org/v4${path}`, { headers: { 'X-Auth-Token': FOOTBALL_DATA_TOKEN } });
+// ── football-data.org helper ──────────────────────────────────
+const fd = async (path) => {
+  const res = await fetch(`https://api.football-data.org/v4${path}`, {
+    headers: { 'X-Auth-Token': FOOTBALL_DATA_TOKEN }
+  });
   if (!res.ok) throw new Error(`football-data ${res.status} ${path}`);
   return res.json();
-}
+};
 
-// ── API-Football (api-sports.io) for leagues football-data doesn't carry ──
-const AF_LEAGUES = { 'Liga Argentina': 128, 'MLS': 253 };
-const AF_OFFSET = 2_000_000_000; // keep AF fixture ids from colliding with football-data ids
-const AF_SEASON = process.env.AF_SEASON || String(new Date().getFullYear());
-async function af(path) {
-  const res = await fetch(`https://v3.football.api-sports.io${path}`, { headers: { 'x-apisports-key': process.env.APIFOOTBALL_TOKEN } });
-  if (!res.ok) throw new Error(`api-football ${res.status} ${path}`);
-  return res.json();
-}
-function afStatus(s) { return ['FT','AET','PEN'].includes(s) ? 'FINISHED' : ['1H','2H','HT','ET','BT','LIVE','P'].includes(s) ? 'IN_PLAY' : 'SCHEDULED'; }
+// ── Constants ─────────────────────────────────────────────────
+const LEAGUES = {
+  PL:  { name: 'Premier League', code: 'PL',  teams: 20, relegated: 3, ucl: 4, flag: '🏴󠁧󠁢󠁥󠁮󠁧󠁿' },
+  PD:  { name: 'La Liga',        code: 'PD',  teams: 20, relegated: 3, ucl: 4, flag: '🇪🇸' },
+  DED: { name: 'Eredivisie',     code: 'DED', teams: 18, relegated: 2, ucl: 2, flag: '🇳🇱' },
+};
+const SEASON = '2026';
+const QUESTION_TYPES = ['topscorer','assists','cleansheet','cards','score','upset'];
 
-// ── auth middleware: ask Supabase to verify the token (no JWT secret needed) ──
-async function auth(req, res, next) {
-  const token = (req.headers.authorization || '').replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: 'unauthorized' });
-  const { data: { user }, error } = await db.auth.getUser(token);
-  if (error || !user) return res.status(401).json({ error: 'unauthorized' });
-  req.userId = user.id;
-  next();
-}
+// ═══════════════════════════════════════════════════════════════
+// ── HEALTH ────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+app.get('/api/health', (_, res) => res.json({ ok: true, v: 2 }));
 
-// ════════ PROFILE ════════
-// Username search
-app.get('/api/users/search', auth, async (req, res) => {
-  const q = (req.query.q||'').toLowerCase().replace(/[^a-z0-9_]/g,'').slice(0,20);
-  if(q.length<2) return res.json([]);
-  const { data } = await db.from('profiles').select('user_id,username,avatar').ilike('username','%'+q+'%').limit(8);
-  res.json((data||[]).filter(u=>u.user_id!==req.userId));
-});
-// Public leaderboard (no auth)
-app.get('/api/leaderboard/public', async (req, res) => {
-  const mon=new Date();mon.setDate(mon.getDate()-((mon.getDay()+6)%7));mon.setHours(0,0,0,0);
-  const { data: preds } = await db.from('predictions').select('user_id,correct,points').not('correct','is',null).gte('created_at',mon.toISOString());
-  const byUser={};(preds||[]).forEach(p=>{if(!byUser[p.user_id])byUser[p.user_id]={correct:0,total:0,pts:0};byUser[p.user_id].total++;if(p.correct)byUser[p.user_id].correct++;byUser[p.user_id].pts+=(p.points||0);});
-  const uids=Object.keys(byUser).slice(0,20);if(!uids.length)return res.json([]);
-  const {data:profs}=await db.from('profiles').select('user_id,username,avatar').in('user_id',uids);
-  const rows=(profs||[]).map(p=>({name:p.username,av:p.avatar,pts:byUser[p.user_id].pts,acc:byUser[p.user_id].total?Math.round(byUser[p.user_id].correct/byUser[p.user_id].total*100):0,preds:byUser[p.user_id].total})).sort((a,b)=>b.acc-a.acc).slice(0,10);
-  res.json(rows);
-});
-app.get('/api/profile', auth, async (req, res) => {
-  const { data } = await db.from('profiles').select('*').eq('id', req.userId).maybeSingle();
-  if (!data) return res.status(404).json({ error: 'no profile' });
-  const { data: allPreds } = await db.from('predictions').select('correct').eq('user_id', req.userId).not('correct','is',null);
-  const settled=(allPreds||[]).length, correct=(allPreds||[]).filter(p=>p.correct).length;
-  const is_verified=settled>=100&&settled>0&&Math.round(correct/settled*100)>=60;
-  res.json({...data, is_verified});
-});
-app.post('/api/profile', auth, async (req, res) => {
-  const username = clean(req.body.username, 20);
-  const avatar = Math.max(0, Math.min(99, parseInt(req.body.avatar) || 10));
-  const fav_team = req.body.fav_team ? clean(req.body.fav_team, 40) : null;
-  if (!/^[A-Za-z0-9_]{3,20}$/.test(username)) return res.status(400).json({ error: 'Username must be 3–20 letters, numbers or underscores.' });
-  const { error } = await db.from('profiles').upsert({ id: req.userId, username, avatar: Math.max(0,Math.min(54,+avatar||10)), fav_team });
-  if (error) return res.status(400).json({ error: error.message.includes('duplicate') ? 'That username is taken.' : error.message });
-  if (fav_team) await db.from('team_follows').upsert({ user_id: req.userId, team: fav_team });
-  res.json({ ok: true });
-});
-
-// ════════ FIXTURES (app reads from your DB) ════════
-// Health check — always 200 so Render deploys never block on DB connectivity
-app.get('/api/health', (req, res) => res.json({ ok: true }));
-
-app.get('/api/fixtures', async (req, res) => {
-  const { comp, from, to } = req.query;
-  let q = db.from('fixtures').select('*').order('utc_date');
-  if (comp) q = q.eq('competition', comp);
-  if (from) q = q.gte('utc_date', from);
-  if (to) q = q.lte('utc_date', to);
-  const { data, error } = await q;
-  if (error) { console.warn('fixtures query error:', error.message); return res.json([]); }
+// ═══════════════════════════════════════════════════════════════
+// ── AUTH / PROFILE ────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+app.get('/api/profile', authMw, async (req, res) => {
+  const { data, error } = await db.from('profiles').select('*').eq('id', req.userId).single();
+  if (error) return res.status(404).json({ error: 'profile not found' });
   res.json(data);
 });
 
-// ════════ PREDICTIONS ════════
-app.post('/api/predictions', auth, async (req, res) => {
-  const { fixture_id, pick, pred_home, pred_away } = req.body; // pick: 'H' | 'D' | 'A'
-  if (!['H','D','A'].includes(pick)) return res.status(400).json({ error: 'invalid pick' });
-  if (!isInt0to99(pred_home) || !isInt0to99(pred_away)) return res.status(400).json({ error: 'scores must be 0–99' });
-  const { data: fx } = await db.from('fixtures').select('utc_date,status').eq('id', fixture_id).single();
-  if (!fx) return res.status(404).json({ error: 'no fixture' });
-  if (new Date(fx.utc_date) <= new Date()) return res.status(400).json({ error: 'Predictions closed — match has kicked off' });
-  const conf=Math.min(5,Math.max(1,parseInt(req.body.confidence)||3));
-  const { error } = await db.from('predictions').upsert(
-    { user_id: req.userId, fixture_id, pick, pred_home: pred_home ?? null, pred_away: pred_away ?? null, confidence: conf, settled: false, points: null },
-    { onConflict: 'user_id,fixture_id' });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ ok: true });
-});
-// my predictions joined with fixture data (for the app to render)
-app.get('/api/me/predictions', auth, async (req, res) => {
-  const { data, error } = await db.from('predictions')
-    .select('*, fixtures(home_team,away_team,competition,home_score,away_score,status)')
-    .eq('user_id', req.userId).order('created_at', { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json((data||[]).map(p => ({
-    fixture_id: p.fixture_id, pick: p.pick, pred_home: p.pred_home, pred_away: p.pred_away,
-    points: p.points, settled: p.settled,
-    home_team: p.fixtures.home_team, away_team: p.fixtures.away_team, competition: p.fixtures.competition,
-    home_score: p.fixtures.home_score, away_score: p.fixtures.away_score, status: p.fixtures.status })));
-});
-
-// ════════ LEADERBOARD ════════
-app.get('/api/leaderboard', async (req, res) => {
-  const league = req.query.league;
-  if (!league) {
-    // Global leaderboard from view
-    const { data, error } = await db.from('leaderboard').select('*').order('points', { ascending: false }).limit(100);
-    if (error) return res.status(500).json({ error: error.message });
-    return res.json(data);
+app.post('/api/profile', authMw, async (req, res) => {
+  const { username, avatar, followed_leagues, followed_team } = req.body;
+  const update = {};
+  if (username) update.username = String(username).toLowerCase().slice(0, 20).replace(/[^a-z0-9_]/g, '');
+  if (avatar !== undefined) update.avatar = avatar;
+  if (followed_leagues) update.followed_leagues = followed_leagues;
+  if (followed_team !== undefined) update.followed_team = followed_team;
+  // Create or update profile
+  const { data: existing } = await db.from('profiles').select('id').eq('id', req.userId).single();
+  if (existing) {
+    await db.from('profiles').update(update).eq('id', req.userId);
+  } else {
+    await db.from('profiles').insert({ id: req.userId, ...update });
   }
-  // League-specific: calculate from predictions joined with fixtures
-  const compCode = COMP_MAP[league] || league;
-  const { data: fixtures } = await db.from('fixtures').select('id').eq('competition', compCode);
-  if (!fixtures?.length) return res.json([]);
-  const fids = fixtures.map(f => f.id);
-  const { data: preds } = await db.from('predictions').select('user_id,correct,points').in('fixture_id', fids).not('correct','is',null);
-  if (!preds?.length) return res.json([]);
-  const byUser = {};
-  (preds||[]).forEach(p => {
-    if (!byUser[p.user_id]) byUser[p.user_id] = { correct: 0, total: 0, pts: 0 };
-    byUser[p.user_id].total++;
-    if (p.correct) byUser[p.user_id].correct++;
-    byUser[p.user_id].pts += (p.points || 0);
-  });
-  const uids = Object.keys(byUser);
-  const { data: profs } = await db.from('profiles').select('id,username,avatar').in('id', uids);
-  const rows = (profs||[]).map(p => ({
-    id: p.id, username: p.username, name: p.username, avatar: p.avatar, av: p.avatar,
-    points: byUser[p.id].pts, pts: byUser[p.id].pts,
-    accuracy: byUser[p.id].total ? Math.round(byUser[p.id].correct / byUser[p.id].total * 100) : 0,
-    acc: byUser[p.id].total ? Math.round(byUser[p.id].correct / byUser[p.id].total * 100) : 0,
-    settled: byUser[p.id].total, preds: byUser[p.id].total
-  })).sort((a, b) => b.accuracy - a.accuracy);
-  res.json(rows);
-});
-
-// ════════ FOLLOWS ════════
-app.post('/api/follow', auth, async (req, res) => {
-  const { followee } = req.body;
-  const { data: ex } = await db.from('follows').select('*').eq('follower_id', req.userId).eq('followee_id', followee).maybeSingle();
-  if (ex) await db.from('follows').delete().eq('follower_id', req.userId).eq('followee_id', followee);
-  else await db.from('follows').insert({ follower_id: req.userId, followee_id: followee });
-  res.json({ following: !ex });
-});
-app.get('/api/me/following', auth, async (req, res) => {
-  const { data: f } = await db.from('follows').select('followee_id').eq('follower_id', req.userId);
-  const ids = (f||[]).map(x => x.followee_id);
-  if (!ids.length) return res.json([]);
-  const { data: profs } = await db.from('profiles').select('id,username,avatar').in('id', ids);
-  res.json(profs || []);
-});
-app.get('/api/user/:uid', auth, async (req, res) => {
-  const uid = req.params.uid;
-  const { data: prof } = await db.from('profiles').select('username,avatar,fav_team,is_verified').eq('id', uid).single();
-  if (!prof) return res.status(404).json({ error: 'not found' });
-  const { data: preds } = await db.from('predictions').select('correct,points').eq('user_id', uid);
-  const settled = (preds || []).filter(p => p.correct !== null);
-  const correct = settled.filter(p => p.correct === true).length;
-  const acc = settled.length ? Math.round(correct / settled.length * 100) : 0;
-  const pts = (preds || []).reduce((s, p) => s + (p.points || 0), 0);
-  res.json({ id: uid, username: prof.username, avatar: prof.avatar, fav_team: prof.fav_team, is_verified: prof.is_verified||false, acc, settled: settled.length, pts });
-});
-app.get('/api/user/:uid/diary', auth, async (req, res) => {
-  const uid = req.params.uid;
-  const { data: flw } = await db.from('follows').select('id').eq('follower_id', req.userId).eq('followee_id', uid).maybeSingle();
-  const vis = flw ? ['public', 'friends'] : ['public'];
-  const { data } = await db.from('diary_posts').select('id,home,away,home_score,away_score,league,rating,note,visibility,created_at').eq('user_id', uid).in('visibility', vis).order('created_at', { ascending: false }).limit(20);
-  res.json(data || []);
-});
-app.get('/api/user/:uid/predictions', auth, async (req, res) => {
-  const uid = req.params.uid;
-  const { data } = await db.from('predictions').select('id,pick,correct,points,created_at,fixtures(home_team,away_team,home_score,away_score,competition,status,utc_date)').eq('user_id', uid).order('created_at', { ascending: false }).limit(30);
-  res.json((data || []).map(p => ({ id: p.id, pick: p.pick, correct: p.correct, points: p.points, created_at: p.created_at, h: p.fixtures?.home_team, a: p.fixtures?.away_team, hs: p.fixtures?.home_score, as: p.fixtures?.away_score, lg: p.fixtures?.competition, status: p.fixtures?.status })));
-});
-
-app.get('/api/me/teams', auth, async (req, res) => {
-  const { data } = await db.from('team_follows').select('team').eq('user_id', req.userId);
-  res.json((data||[]).map(r => r.team));
-});
-app.post('/api/team-follow', auth, async (req, res) => {
-  const { team } = req.body;
-  const { data: ex } = await db.from('team_follows').select('*').eq('user_id', req.userId).eq('team', team).maybeSingle();
-  if (ex) await db.from('team_follows').delete().eq('user_id', req.userId).eq('team', team);
-  else await db.from('team_follows').insert({ user_id: req.userId, team });
-  res.json({ following: !ex });
-});
-
-// ════════ DIARY + COMMENTS ════════
-app.get('/api/diary', auth, async (req, res) => {
-  const { data: bl } = await db.from('blocks').select('blocked_id').eq('blocker_id', req.userId);
-  const blocked = (bl || []).map(b => b.blocked_id);
-  let { data, error } = await db.from('diary_posts')
-    .select('*, profiles(username,avatar,is_verified), comments(body,profiles(username)), post_reactions(emoji,user_id)')
-    .order('created_at', { ascending: false }).limit(80);
-  if (error) return res.status(500).json({ error: error.message });
-  const posts = (data || []).filter(p => !blocked.includes(p.user_id)).map(p => {
-    const reactions = {};
-    (p.post_reactions||[]).forEach(r => {
-      if(!reactions[r.emoji]) reactions[r.emoji]={count:0,users:[]};
-      reactions[r.emoji].count++;reactions[r.emoji].users.push(r.user_id);
-    });
-    return { ...p, reactions, post_reactions: undefined };
-  });
-  res.json(posts);
-});
-app.post('/api/diary', auth, async (req, res) => {
-  const home = clean(req.body.home, 40), away = clean(req.body.away, 40);
-  const rating = parseInt(req.body.rating);
-  const visibility = ['private','friends','public'].includes(req.body.visibility) ? req.body.visibility : 'public';
-  if (!home || !away) return res.status(400).json({ error: 'teams required' });
-  if (!isInt0to99(req.body.home_score) || !isInt0to99(req.body.away_score)) return res.status(400).json({ error: 'scores must be 0–99' });
-  if (!(rating >= 1 && rating <= 5)) return res.status(400).json({ error: 'rating 1–5' });
-  const match_date = req.body.match_date || null;
-  const { error } = await db.from('diary_posts').insert({ user_id: req.userId, home, away, home_score: +req.body.home_score, away_score: +req.body.away_score, league: clean(req.body.league, 40), rating, note: clean(req.body.note, 280), visibility, match_date });
-  if (error) return res.status(400).json({ error: error.message });
-  res.json({ ok: true });
-});
-app.delete('/api/diary/:id', auth, async (req, res) => {
-  const { error } = await db.from('diary_posts').delete().eq('id', req.params.id).eq('user_id', req.userId);
-  if (error) return res.status(400).json({ error: error.message });
-  res.json({ ok: true });
-});
-app.patch('/api/diary/:id', auth, async (req, res) => {
-  const { data: post } = await db.from('diary_posts').select('user_id').eq('id', req.params.id).single();
-  if (!post || post.user_id !== req.userId) return res.status(403).json({ error: 'forbidden' });
-  const rating = parseInt(req.body.rating);
-  if (!(rating >= 1 && rating <= 5)) return res.status(400).json({ error: 'rating 1–5' });
-  const { error } = await db.from('diary_posts').update({ home_score: +req.body.home_score, away_score: +req.body.away_score, rating, note: clean(req.body.note, 280) }).eq('id', req.params.id);
-  if (error) return res.status(400).json({ error: error.message });
-  res.json({ ok: true });
-});
-app.post('/api/comments', auth, async (req, res) => {
-  const body = clean(req.body.body, 500);
-  if (!body) return res.status(400).json({ error: 'empty comment' });
-  const { error } = await db.from('comments').insert({ post_id: req.body.post_id, user_id: req.userId, body });
-  if (error) return res.status(400).json({ error: error.message });
-  res.json({ ok: true });
-});
-
-// ── moderation: block + report (stores require these for user content) ──
-app.post('/api/block', auth, async (req, res) => {
-  const blocked = req.body.blocked;
-  const { data: ex } = await db.from('blocks').select('*').eq('blocker_id', req.userId).eq('blocked_id', blocked).maybeSingle();
-  if (ex) await db.from('blocks').delete().eq('blocker_id', req.userId).eq('blocked_id', blocked);
-  else { await db.from('blocks').insert({ blocker_id: req.userId, blocked_id: blocked }); await db.from('follows').delete().eq('follower_id', req.userId).eq('followee_id', blocked); }
-  res.json({ blocked: !ex });
-});
-app.get('/api/me/blocks', auth, async (req, res) => {
-  const { data } = await db.from('blocks').select('blocked_id').eq('blocker_id', req.userId);
-  res.json((data || []).map(b => b.blocked_id));
-});
-app.post('/api/report', auth, async (req, res) => {
-  const target_type = req.body.target_type;
-  if (!['post','comment','user'].includes(target_type)) return res.status(400).json({ error: 'bad target' });
-  await db.from('reports').insert({ reporter_id: req.userId, target_type, target_id: String(req.body.target_id), reason: clean(req.body.reason, 300) });
-  res.json({ ok: true });
-});
-
-// ════════ PRIVATE LEAGUES ════════
-const code5 = () => Math.random().toString(36).slice(2, 7).toUpperCase();
-app.post('/api/leagues', auth, async (req, res) => {
-  const { name, competition, scope, split, entry, cash_stake } = req.body;
-  const { data: prof } = await db.from('profiles').select('is_pro').eq('id', req.userId).single();
-  if (!prof?.is_pro) {
-    const { count } = await db.from('leagues').select('*', { count: 'exact', head: true }).eq('owner_id', req.userId);
-    if (count >= 2) return res.status(403).json({ error: 'Free accounts can create up to 2 leagues. Upgrade to Pro for unlimited.' });
-  }
-  const { data, error } = await db.from('leagues').insert({ owner_id: req.userId, name, competition, scope, split, entry: entry ?? 100, cash_stake: cash_stake ?? null, code: code5() }).select().single();
-  if (error) return res.status(400).json({ error: error.message });
-  await db.from('league_members').insert({ league_id: data.id, user_id: req.userId });
+  const { data } = await db.from('profiles').select('*').eq('id', req.userId).single();
   res.json(data);
 });
-app.post('/api/leagues/join', auth, async (req, res) => {
-  const { code } = req.body;
-  const { data: lg } = await db.from('leagues').select('id').eq('code', code.toUpperCase()).maybeSingle();
-  if (!lg) return res.status(404).json({ error: 'no such league' });
-  await db.from('league_members').upsert({ league_id: lg.id, user_id: req.userId });
-  res.json({ ok: true, league_id: lg.id });
+
+// ═══════════════════════════════════════════════════════════════
+// ── LIVE STANDINGS ────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+app.get('/api/standings/:league', rl(120), async (req, res) => {
+  const code = req.params.league.toUpperCase();
+  if (!LEAGUES[code]) return res.status(400).json({ error: 'unknown league' });
+  const { data } = await db.from('live_standings').select('*').eq('id', `${code}_${SEASON}`).single();
+  if (!data) return res.json({ league: code, table: [], gameweek: 0 });
+  res.json({ league: code, name: LEAGUES[code].name, table: data.table_data, gameweek: data.gameweek, updated: data.updated_at });
 });
-app.get('/api/leagues', auth, async (req, res) => {
-  const { data, error } = await db.from('league_members')
-    .select('points, leagues(*, league_members(points, profiles(username,avatar)))')
-    .eq('user_id', req.userId);
+
+
+// ── Global public leaderboard (all users, per league) ────────
+app.get('/api/global-standings/:league', rl(120), async (req, res) => {
+  const code = req.params.league.toUpperCase();
+  if (!LEAGUES[code]) return res.status(400).json({ error: 'unknown league' });
+  const limit = Math.min(parseInt(req.query.limit)||50, 200);
+  const { data, error } = await db
+    .from('table_predictions')
+    .select('user_id,score,bonus_champion,profiles(username,avatar)')
+    .eq('league_id', code)
+    .eq('season', SEASON)
+    .order('score', { ascending: false })
+    .limit(limit);
   if (error) return res.status(500).json({ error: error.message });
-  res.json((data||[]).map(r => r.leagues));
-});
-
-
-// ════════ CROWD VOTE ════════
-app.get('/api/fixture/:id/crowd', auth, async (req, res) => {
-  const { data } = await db.from('predictions').select('pick').eq('fixture_id', req.params.id);
-  const ct = {1:0,0:0,2:0}; (data||[]).forEach(p=>{if(ct[p.pick]!==undefined)ct[p.pick]++;});
-  const total = Object.values(ct).reduce((s,n)=>s+n,0);
-  if(!total) return res.json({home:null,draw:null,away:null,total:0});
-  res.json({home:Math.round(ct[1]/total*100),draw:Math.round(ct[0]/total*100),away:Math.round(ct[2]/total*100),total});
-});
-
-// ════════ REACTIONS ════════
-app.get('/api/reactions/:postId', async (req, res) => {
-  const { data } = await db.from('post_reactions').select('emoji,user_id').eq('post_id', req.params.postId);
-  const grouped = {};
-  (data||[]).forEach(r => { if(!grouped[r.emoji]) grouped[r.emoji]={count:0,users:[]}; grouped[r.emoji].count++; grouped[r.emoji].users.push(r.user_id); });
-  res.json(grouped);
-});
-app.post('/api/reactions', auth, async (req, res) => {
-  const { post_id, emoji } = req.body;
-  if(!['⚽','🔥','💀','😬','🎯'].includes(emoji)) return res.status(400).json({error:'invalid emoji'});
-  const { data: ex } = await db.from('post_reactions').select('id').eq('post_id',post_id).eq('user_id',req.userId).eq('emoji',emoji).maybeSingle();
-  if(ex) await db.from('post_reactions').delete().eq('id',ex.id);
-  else await db.from('post_reactions').insert({post_id,user_id:req.userId,emoji});
-  res.json({ok:true});
-});
-
-// ════════ ACTIVITY FEED ════════
-app.get('/api/activity', auth, async (req, res) => {
-  const since = new Date(Date.now()-7*864e5).toISOString();
-  const { data: follows } = await db.from('follows').select('follower_id,created_at,profiles!follower_id(username,avatar)').eq('followee_id',req.userId).gte('created_at',since).order('created_at',{ascending:false}).limit(10);
-  const { data: myPosts } = await db.from('diary_posts').select('id').eq('user_id',req.userId);
-  const pids = (myPosts||[]).map(p=>p.id); let cmts=[];
-  if(pids.length){const {data:cc}=await db.from('comments').select('body,created_at,user_id,profiles!user_id(username,avatar)').in('post_id',pids).neq('user_id',req.userId).gte('created_at',since).order('created_at',{ascending:false}).limit(10);cmts=cc||[];}
-  const { data: settled } = await db.from('predictions').select('pick,correct,points,updated_at,fixtures(home_team,away_team)').eq('user_id',req.userId).not('correct','is',null).gte('updated_at',since).order('updated_at',{ascending:false}).limit(10);
-  const act=[
-    ...(follows||[]).map(f=>({type:'follow',user:f.profiles?.username,av:f.profiles?.avatar,uid:f.follower_id,at:f.created_at})),
-    ...cmts.map(cm=>({type:'comment',user:cm.profiles?.username,av:cm.profiles?.avatar,body:cm.body,at:cm.created_at})),
-    ...(settled||[]).map(p=>({type:'settle',ok:p.correct,pts:p.points,h:p.fixtures?.home_team,a:p.fixtures?.away_team,at:p.updated_at})),
-  ].sort((a,b)=>new Date(b.at)-new Date(a.at)).slice(0,25);
-  res.json(act);
-});
-
-// ════════ WEEKLY LEADERBOARD ════════
-app.get('/api/leaderboard/week', auth, async (req, res) => {
-  const mon=new Date();mon.setDate(mon.getDate()-((mon.getDay()+6)%7));mon.setHours(0,0,0,0);
-  const { data: preds } = await db.from('predictions').select('user_id,correct,points').not('correct','is',null).gte('created_at',mon.toISOString());
-  const byUser={};(preds||[]).forEach(p=>{if(!byUser[p.user_id])byUser[p.user_id]={correct:0,total:0,pts:0};byUser[p.user_id].total++;if(p.correct)byUser[p.user_id].correct++;byUser[p.user_id].pts+=(p.points||0);});
-  const uids=Object.keys(byUser);if(!uids.length)return res.json([]);
-  const {data:profs}=await db.from('profiles').select('user_id,username,avatar').in('user_id',uids);
-  const rows=(profs||[]).map(p=>({id:p.user_id,name:p.username,av:p.avatar,pts:byUser[p.user_id].pts,acc:byUser[p.user_id].total?Math.round(byUser[p.user_id].correct/byUser[p.user_id].total*100):0,preds:byUser[p.user_id].total})).sort((a,b)=>b.acc-a.acc);
+  const rows = (data||[]).map((p,i) => ({
+    id: p.user_id,
+    name: p.profiles?.username || '?',
+    av: p.profiles?.avatar || 0,
+    score: p.score || 0,
+    champion: p.bonus_champion || null,
+    rank: i + 1
+  }));
   res.json(rows);
 });
 
-// ════ ACCOUNT DELETION ════
-app.delete('/api/account', auth, async (req, res) => {
-  const uid = req.userId;
-  try {
-    await db.from('predictions').delete().eq('user_id', uid);
-    await db.from('diary_posts').delete().eq('user_id', uid);
-    await db.from('follows').delete().or(`follower_id.eq.${uid},followee_id.eq.${uid}`);
-    await db.from('team_follows').delete().eq('user_id', uid);
-    await db.from('post_reactions').delete().eq('user_id', uid);
-    await db.from('profiles').delete().eq('id', uid);
-    const { createClient } = await import('@supabase/supabase-js');
-    const admin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, {auth:{autoRefreshToken:false,persistSession:false}});
-    await admin.auth.admin.deleteUser(uid);
-    res.json({ ok: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-// ════════ SYNC + AUTO-SETTLE (cron) ════════
-async function runSync(src = 'all') {
-  const now = Date.now();
-  const from = new Date(now - 2*864e5).toISOString().slice(0,10);
-  const to = new Date(now + 90*864e5).toISOString().slice(0,10);
-  let upserted = 0, settled = 0;
-  if (src !== 'af') for (const code of Object.values(COMP_MAP)) {
-    let data; try { data = await fd(`/competitions/${code}/matches?dateFrom=${from}&dateTo=${to}${code==='WC'?'&season=2026':''}`); console.log(`fd ${code}: ${data?.matches?.length||0} matches`); } catch (e) { console.warn(`fd ${code} error: ${e.message}`); continue; }
-    for (const m of data.matches || []) {
-      const row = { id:m.id, competition:code, home_team:m.homeTeam.name, away_team:m.awayTeam.name, home_crest:m.homeTeam.crest||null, away_crest:m.awayTeam.crest||null, utc_date:m.utcDate, status:m.status, home_score:m.score?.fullTime?.home ?? null, away_score:m.score?.fullTime?.away ?? null, matchday:m.matchday ?? null, updated_at:new Date().toISOString() };
-      const { error: uErr } = await db.from('fixtures').upsert(row);
-      if (uErr) { console.error('upsert error:', uErr.message, 'row id:', row.id); continue; }
-      upserted++;
-      if (m.status === 'FINISHED') settled += await settleFixture(row);
-    }
-    await new Promise(r => setTimeout(r, 6500)); // free-tier rate limit
+// ── Sync standings from football-data.org ─────────────────────
+async function syncStandings() {
+  const results = {};
+  for (const [code, lg] of Object.entries(LEAGUES)) {
+    try {
+      const data = await fd(`/competitions/${code}/standings?season=${SEASON}`);
+      const table = (data.standings?.[0]?.table || []).map(row => ({
+        position: row.position,
+        team: row.team.name,
+        shortName: row.team.shortName || row.team.tla,
+        crest: row.team.crest,
+        played: row.playedGames,
+        won: row.won, draw: row.draw, lost: row.lost,
+        gf: row.goalsFor, ga: row.goalsAgainst,
+        gd: row.goalDifference,
+        points: row.points,
+        form: row.form || ''
+      }));
+      const gw = data.season?.currentMatchday || 0;
+      await db.from('live_standings').upsert({
+        id: `${code}_${SEASON}`, league_id: code, season: SEASON,
+        table_data: table, gameweek: gw, updated_at: new Date().toISOString()
+      }, { onConflict: 'id' });
+      results[code] = { teams: table.length, gw };
+    } catch(e) { results[code] = { error: e.message }; }
   }
-  // API-Football leagues (Saudi, MLS, Liga MX, Liga Argentina, Jupiler)
-  if (src !== 'fd' && process.env.APIFOOTBALL_TOKEN) {
-    for (const [name, id] of Object.entries(AF_LEAGUES)) {
-      let data; try { data = await af(`/fixtures?league=${id}&season=${AF_SEASON}&from=${from}&to=${to}`); console.log(`af ${name}: ${data?.response?.length||0} fixtures`); } catch (e) { console.warn(`af ${name} error: ${e.message}`); continue; }
-      for (const m of data.response || []) {
-        const status = afStatus(m.fixture.status.short);
-        const row = { id: AF_OFFSET + m.fixture.id, competition: name, home_team: m.teams.home.name, away_team: m.teams.away.name, home_crest: m.teams.home.logo||null, away_crest: m.teams.away.logo||null, utc_date: m.fixture.date, status, home_score: m.goals.home, away_score: m.goals.away, matchday: null, updated_at: new Date().toISOString() };
-        await db.from('fixtures').upsert(row); upserted++;
-        if (status === 'FINISHED' && row.home_score != null) settled += await settleFixture(row);
-      }
-      await new Promise(r => setTimeout(r, 1500));
-    }
-  }
-  return { upserted, settled };
+  return results;
 }
 
-// ── Spend points (free-tier edit unlock) ──────────────────────────────────────
-app.post('/api/pts/spend', auth, async (req, res) => {
-  const amount = parseInt(req.body.amount) || 0;
-  if (amount <= 0) return res.status(400).json({ error: 'Invalid amount' });
-  const { data: prof } = await db.from('profiles').select('pts_spent').eq('id', req.userId).single();
-  const current = prof?.pts_spent || 0;
-  const { error } = await db.from('profiles').update({ pts_spent: current + amount }).eq('id', req.userId);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ ok: true, pts_spent: current + amount });
+// ═══════════════════════════════════════════════════════════════
+// ── TABLE PREDICTIONS ─────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+app.get('/api/table-prediction/:league', authMw, async (req, res) => {
+  const code = req.params.league.toUpperCase();
+  const { data: pred } = await db.from('table_predictions')
+    .select('*').eq('user_id', req.userId).eq('league_id', code).eq('season', SEASON).single();
+  const { data: live } = await db.from('live_standings').select('table_data,gameweek').eq('id', `${code}_${SEASON}`).single();
+  // Deadline = end of GW1 (set to a fixed date per league per season)
+  const deadline = getDeadline(code);
+  const isLocked = pred?.locked || new Date() > deadline;
+  res.json({ prediction: pred || null, live: live?.table_data || [], gameweek: live?.gameweek || 0, deadline: deadline.toISOString(), locked: isLocked });
 });
 
-// ════ DEBUG ENDPOINT (remove in production) ════
-app.get('/api/debug', async (req, res) => {
-  const checks = { timestamp: new Date().toISOString(), env: {} };
-  // Env vars
-  checks.env.football_data_token = FOOTBALL_DATA_TOKEN ? `set (${FOOTBALL_DATA_TOKEN.slice(0,6)}...)` : 'MISSING';
-  checks.env.apifootball_token = process.env.APIFOOTBALL_TOKEN ? `set (${process.env.APIFOOTBALL_TOKEN.slice(0,6)}...)` : 'MISSING';
-  checks.env.supabase_service_key = process.env.SUPABASE_SERVICE_KEY ? 'set' : 'MISSING';
-  checks.env.cron_secret = CRON_SECRET ? `set (${CRON_SECRET.slice(0,4)}...)` : 'NOT SET (sync open to all)';
-  // Fixtures table check
-  try { const { count, error } = await db.from('fixtures').select('*',{count:'exact',head:true}); checks.fixtures_count = error ? `ERROR: ${error.message}` : count; } catch(e) { checks.fixtures_count = `EXCEPTION: ${e.message}`; }
-  // Column check
-  try { const { data, error } = await db.from('fixtures').select('id,home_crest,away_crest,matchday,updated_at').limit(1); checks.fixtures_columns = error ? `MISSING COLUMNS: ${error.message}` : 'OK'; } catch(e) { checks.fixtures_columns = `ERROR: ${e.message}`; }
-  // Test football-data.org PL
-  try { const d = await fd('/competitions/PL/matches?dateFrom=2026-06-01&dateTo=2026-07-01'); checks.fd_PL = `OK - ${d.matches?.length||0} matches`; } catch(e) { checks.fd_PL = `ERROR: ${e.message}`; }
-  // Test football-data.org WC
-  try { const d = await fd('/competitions/WC/matches?dateFrom=2026-06-01&dateTo=2026-09-01&season=2026'); checks.fd_WC = `OK - ${d.matches?.length||0} matches`; } catch(e) { checks.fd_WC = `ERROR: ${e.message}`; }
-  // Test API-Football WC
-  if (process.env.APIFOOTBALL_TOKEN) {
-    try { const d = await af(`/fixtures?league=1&season=2026&from=2026-06-01&to=2026-09-01`); checks.af_WC = `OK - ${d.response?.length||0} fixtures`; } catch(e) { checks.af_WC = `ERROR: ${e.message}`; }
-  } else { checks.af_WC = 'skipped - no APIFOOTBALL_TOKEN'; }
-  res.json(checks);
+app.post('/api/table-prediction', authMw, rl(30), async (req, res) => {
+  const { league_id, predicted_table, bonus_champion, bonus_top4, bonus_relegated } = req.body;
+  const code = (league_id || '').toUpperCase();
+  if (!LEAGUES[code]) return res.status(400).json({ error: 'unknown league' });
+  const deadline = getDeadline(code);
+  // Check if past deadline
+  const { data: existing } = await db.from('table_predictions')
+    .select('locked').eq('user_id', req.userId).eq('league_id', code).eq('season', SEASON).single();
+  if (existing?.locked) return res.status(403).json({ error: 'Prediction is locked for this season.' });
+  if (new Date() > deadline && !existing) return res.status(403).json({ error: 'Deadline has passed.' });
+  const { data, error } = await db.from('table_predictions').upsert({
+    user_id: req.userId, league_id: code, season: SEASON,
+    predicted_table, bonus_champion: bonus_champion || null,
+    bonus_top4: bonus_top4 || [], bonus_relegated: bonus_relegated || [],
+    locked: new Date() > deadline,
+    submitted_at: new Date().toISOString()
+  }, { onConflict: 'user_id,league_id,season' }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 });
-app.get('/api/sync', async (req, res) => {
-  // Sync is safe to expose — it only fetches public football data
-  // Protect against spam with rate limiting (already applied globally)
-  try { const result=await runSync(req.query.src || 'all'); console.log('Manual sync result:', JSON.stringify(result)); res.json({ ok: true, ...result }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-async function settleFixture(fx) {
-  if (fx.home_score == null) return 0;
-  const result = fx.home_score > fx.away_score ? 'H' : fx.away_score > fx.home_score ? 'A' : 'D';
-  const { data: preds } = await db.from('predictions').select('*').eq('fixture_id', fx.id).eq('settled', false);
+
+// ── Scoring engine ────────────────────────────────────────────
+function scoreTablePrediction(predicted, actual, bonusChampion, bonusTop4 = [], bonusRelegated = [], leagueCode = 'PL') {
+  const lg = LEAGUES[leagueCode] || LEAGUES.PL;
+  let pts = 0;
+  const actualMap = new Map(actual.map(t => [t.team, t]));
+  for (const pred of predicted) {
+    const real = actualMap.get(pred.team);
+    if (!real) continue;
+    const diff = Math.abs(pred.position - real.position);
+    if (diff === 0) pts += 5;
+    else if (diff === 1) pts += 3;
+    else if (diff === 2) pts += 2;
+    else if (diff === 3) pts += 1;
+  }
+  // Bonus: champion
+  if (bonusChampion && actual[0]?.team === bonusChampion) pts += 10;
+  // Bonus: top positions (UCL spots)
+  const topN = actual.slice(0, lg.ucl).map(t => t.team);
+  for (const t of bonusTop4) { if (topN.includes(t)) pts += 2; }
+  // Bonus: relegated
+  const relN = actual.slice(-lg.relegated).map(t => t.team);
+  for (const t of bonusRelegated) { if (relN.includes(t)) pts += 2; }
+  return pts;
+}
+
+// ── Recalculate scores for all predictions in a league ────────
+async function recalcLeagueScores(code) {
+  const { data: live } = await db.from('live_standings').select('table_data').eq('id', `${code}_${SEASON}`).single();
+  if (!live?.table_data?.length) return 0;
+  const { data: preds } = await db.from('table_predictions')
+    .select('id,user_id,predicted_table,bonus_champion,bonus_top4,bonus_relegated')
+    .eq('league_id', code).eq('season', SEASON);
   if (!preds?.length) return 0;
   for (const p of preds) {
-    let pts = 0;
-    const correct = p.pick === result;
-    if (correct) pts += 3;
-    if (p.pred_home === fx.home_score && p.pred_away === fx.away_score) pts += 2;
-    await db.from('predictions').update({
-      points: pts,
-      settled: true,
-      correct,
-      home_score: fx.home_score,
-      away_score: fx.away_score
-    }).eq('id', p.id);
+    const score = scoreTablePrediction(p.predicted_table, live.table_data, p.bonus_champion, p.bonus_top4, p.bonus_relegated, code);
+    await db.from('table_predictions').update({ score }).eq('id', p.id);
   }
-  // Send push notifications
-  for (const p of preds) {
-    const correct = p.pick === result;
-    const pts = (correct ? 3 : 0) + (p.pred_home === fx.home_score && p.pred_away === fx.away_score ? 2 : 0);
-    const title = correct ? '✅ Correct call! +' + pts + 'pts' : '❌ Not this time';
-    const body = `${fx.home_team} ${fx.home_score}–${fx.away_score} ${fx.away_team}`;
-    sendPush(p.user_id, title, body, '/').catch(() => {});
-  }
-  console.log(`settled fixture ${fx.id} (${fx.home_team} vs ${fx.away_team}): ${preds.length} predictions`);
   return preds.length;
 }
 
-
-// ── Cron endpoint — call from UptimeRobot or external scheduler ─────────────
-app.get('/api/cron', async (req, res) => {
-  const secret = req.headers['x-cron-secret'] || req.query.secret;
-  if (secret !== process.env.CRON_SECRET) return res.status(401).json({ error: 'unauthorized' });
-  try {
-    const result = await runSync();
-    res.json({ ok: true, ...result });
-  } catch (e) {
-    console.error('cron error:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ── Re-settle all unsettled predictions (catch-up for missed cron runs) ──────
-app.post('/api/admin/resettle', async (req, res) => {
-  const secret = req.headers['x-cron-secret'] || req.body?.secret;
-  if (secret !== process.env.CRON_SECRET) return res.status(401).json({ error: 'unauthorized' });
-  try {
-    // Get all unsettled predictions
-    const { data: unsettled } = await db
-      .from('predictions')
-      .select('fixture_id')
-      .eq('settled', false);
-    if (!unsettled?.length) return res.json({ ok: true, settled: 0, message: 'nothing to settle' });
-
-    const fxIds = [...new Set(unsettled.map(p => p.fixture_id))];
-    let settled = 0;
-    for (const fxId of fxIds) {
-      const { data: fx } = await db.from('fixtures').select('*').eq('id', fxId).single();
-      if (fx?.status === 'FINISHED' && fx.home_score != null) {
-        settled += await settleFixture(fx);
-      }
-    }
-    res.json({ ok: true, settled, checked: fxIds.length });
-  } catch (e) {
-    console.error('resettle error:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-
-// ── Push subscription ────────────────────────────────────────────────────────
-app.post('/api/push-subscribe', authMw, async (req, res) => {
-  const { subscription } = req.body;
-  if (!subscription) return res.status(400).json({ error: 'no subscription' });
-  await db.from('push_subscriptions').upsert({
-    user_id: req.user.id,
-    subscription: JSON.stringify(subscription),
-    updated_at: new Date().toISOString()
-  }, { onConflict: 'user_id' });
-  res.json({ ok: true });
-});
-
-// ── Send push to a user ───────────────────────────────────────────────────────
-async function sendPush(userId, title, body, url='/') {
-  if (!VAPID_PUBLIC || !VAPID_PRIVATE) return;
-  try {
-    const { data } = await db.from('push_subscriptions').select('subscription').eq('user_id', userId).single();
-    if (!data?.subscription) return;
-    const sub = JSON.parse(data.subscription);
-    await webpush.sendNotification(sub, JSON.stringify({ title, body, url }));
-  } catch (e) {
-    if (e.statusCode === 410) {
-      // Subscription expired — remove it
-      await db.from('push_subscriptions').delete().eq('user_id', userId);
-    }
-    console.warn('Push send failed for', userId, e.message);
-  }
+function getDeadline(code) {
+  // After gameweek 1 — set per league. Adjust these dates each season.
+  // 2026/27 season — after GW1 weekend
+  const deadlines = {
+    PL:  '2026-08-10T23:59:00Z',  // PL starts 8 Aug 2026
+    PD:  '2026-08-17T23:59:00Z',  // La Liga starts 15 Aug 2026
+    DED: '2026-08-03T23:59:00Z',  // Eredivisie starts 1 Aug 2026
+  };
+  return new Date(deadlines[code] || '2025-08-24T23:59:00Z');
 }
 
-// ── VAPID public key endpoint (for frontend) ─────────────────────────────────
-app.get('/api/vapid-public', (req, res) => {
-  res.json({ key: VAPID_PUBLIC });
+// ── League standings (friend group) ──────────────────────────
+app.get('/api/league-standings/:leagueId', authMw, async (req, res) => {
+  const { leagueId } = req.params;
+  const { data: members } = await db.from('league_members')
+    .select('user_id,profiles(username,avatar)').eq('league_id', leagueId);
+  if (!members?.length) return res.json([]);
+  const uids = members.map(m => m.user_id);
+  const { data: lg } = await db.from('leagues').select('competition').eq('id', leagueId).single();
+  const code = lg?.competition?.toUpperCase();
+  const { data: preds } = await db.from('table_predictions')
+    .select('user_id,score,predicted_table,bonus_champion,submitted_at').eq('league_id', code).eq('season', SEASON).in('user_id', uids);
+  const predMap = new Map((preds || []).map(p => [p.user_id, p]));
+  const rows = members.map(m => {
+    const p = predMap.get(m.user_id) || {};
+    return { id: m.user_id, name: m.profiles?.username || '?', av: m.profiles?.avatar || 0, score: p.score || 0, champion: p.bonus_champion || null, submitted: !!p.submitted_at };
+  }).sort((a, b) => b.score - a.score);
+  res.json(rows);
 });
 
-
-// ══════════════════════════════════════════════════════════
-// ── HEAD-TO-HEAD ──────────────────────────────────────────
-// ══════════════════════════════════════════════════════════
-app.get('/api/h2h', authMw, async (req, res) => {
-  const { user1, user2 } = req.query;
-  if (!user1 || !user2) return res.status(400).json({ error: 'need user1 and user2' });
-  try {
-    // Get both users' profiles
-    const { data: profiles } = await db.from('profiles')
-      .select('id,username,avatar,accuracy,points')
-      .in('id', [user1, user2]);
-    // Get predictions for both users on same fixtures
-    const { data: preds1 } = await db.from('predictions')
-      .select('fixture_id,pick,correct,points,pred_home,pred_away,home_score,away_score')
-      .eq('user_id', user1).eq('settled', true);
-    const { data: preds2 } = await db.from('predictions')
-      .select('fixture_id,pick,correct,points,pred_home,pred_away,home_score,away_score')
-      .eq('user_id', user2).eq('settled', true);
-    // Find shared fixtures
-    const p2map = new Map((preds2||[]).map(p => [p.fixture_id, p]));
-    const shared = (preds1||[]).filter(p => p2map.has(p.fixture_id)).map(p => ({
-      fid: p.fixture_id,
-      u1: { correct: p.correct, pts: p.points, pick: p.pick, ph: p.pred_home, pa: p.pred_away },
-      u2: (() => { const p2 = p2map.get(p.fixture_id); return { correct: p2.correct, pts: p2.points, pick: p2.pick, ph: p2.pred_home, pa: p2.pred_away }; })(),
-      score: `${p.home_score??'?'}-${p.away_score??'?'}`
-    }));
-    // Get fixture names for shared
-    const fids = shared.map(s => s.fid);
-    const { data: fixtures } = fids.length ? await db.from('fixtures').select('id,home_team,away_team,date').in('id', fids) : { data: [] };
-    const fmap = new Map((fixtures||[]).map(f => [f.id, f]));
-    const result = shared.map(s => ({ ...s, h: fmap.get(s.fid)?.home_team, a: fmap.get(s.fid)?.away_team, date: fmap.get(s.fid)?.date }));
-    res.json({ profiles: profiles||[], shared: result.sort((a,b)=>(b.date||'').localeCompare(a.date||'')) });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+// ── Compare predictions side by side ─────────────────────────
+app.get('/api/table-compare/:league', authMw, async (req, res) => {
+  const code = req.params.league.toUpperCase();
+  const { leagueId } = req.query;
+  let uids = [];
+  if (leagueId) {
+    const { data: members } = await db.from('league_members').select('user_id').eq('league_id', leagueId);
+    uids = (members || []).map(m => m.user_id);
+    if (!uids.includes(req.userId)) return res.status(403).json({ error: 'not a member' });
+  } else { uids = [req.userId]; }
+  const { data: preds } = await db.from('table_predictions')
+    .select('user_id,predicted_table,bonus_champion,score,profiles(username,avatar)')
+    .eq('league_id', code).eq('season', SEASON).in('user_id', uids);
+  res.json(preds || []);
 });
 
-// ══════════════════════════════════════════════════════════
-// ── PUBLIC LEAGUES ────────────────────────────────────────
-// ══════════════════════════════════════════════════════════
-app.get('/api/leagues/public', async (req, res) => {
-  try {
-    const { comp, team } = req.query;
-    let q = db.from('leagues').select('id,name,competition,emoji,team_filter,code,created_at,league_members(count)').eq('is_public', true);
-    if (comp) q = q.eq('competition', comp);
-    if (team) q = q.eq('team_filter', team);
-    const { data, error } = await q.order('created_at', { ascending: false }).limit(50);
-    if (error) return res.status(500).json({ error: error.message });
-    res.json((data||[]).map(l => ({
-      id: l.id, name: l.name, comp: l.competition, emoji: l.emoji||'⚽',
-      team: l.team_filter, code: l.code,
-      members: l.league_members?.[0]?.count || 0
-    })));
-  } catch(e) { res.status(500).json({ error: e.message }); }
+// ═══════════════════════════════════════════════════════════════
+// ── WEEKLY PICKS ──────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+app.get('/api/weekly-question/:league', authMw, async (req, res) => {
+  const code = req.params.league.toUpperCase();
+  if (!LEAGUES[code]) return res.status(400).json({ error: 'unknown league' });
+  // Get current gameweek from standings
+  const { data: live } = await db.from('live_standings').select('gameweek').eq('id', `${code}_${SEASON}`).single();
+  const gw = live?.gameweek || 1;
+  const qType = QUESTION_TYPES[(gw - 1) % QUESTION_TYPES.length];
+  const qId = `${code}_GW${gw}_${qType}`;
+  const { data: q } = await db.from('weekly_questions').select('*').eq('id', qId).single();
+  if (!q) return res.json(null);
+  // Get user's pick if exists
+  const { data: pick } = await db.from('weekly_picks').select('*').eq('user_id', req.userId).eq('question_id', qId).single();
+  res.json({ question: q, pick: pick || null, gameweek: gw });
 });
 
-app.post('/api/leagues/make-public', authMw, async (req, res) => {
-  const { league_id, emoji, team_filter } = req.body;
-  const { data: lg } = await db.from('leagues').select('owner_id').eq('id', league_id).single();
-  if (lg?.owner_id !== req.user.id) return res.status(403).json({ error: 'not your league' });
-  await db.from('leagues').update({ is_public: true, emoji: emoji||'⚽', team_filter: team_filter||null }).eq('id', league_id);
-  res.json({ ok: true });
+app.post('/api/weekly-pick', authMw, rl(30), async (req, res) => {
+  const { question_id, pick } = req.body;
+  if (!question_id || !pick) return res.status(400).json({ error: 'question_id and pick required' });
+  const { data: q } = await db.from('weekly_questions').select('deadline,settled').eq('id', question_id).single();
+  if (!q) return res.status(404).json({ error: 'question not found' });
+  if (q.settled) return res.status(403).json({ error: 'Question already settled' });
+  if (new Date() > new Date(q.deadline)) return res.status(403).json({ error: 'Deadline passed' });
+  const { data } = await db.from('weekly_picks').upsert({ user_id: req.userId, question_id, pick, picked_at: new Date().toISOString() }, { onConflict: 'user_id,question_id' }).select().single();
+  res.json(data);
 });
 
-// ══════════════════════════════════════════════════════════
-// ── LEAGUE HISTORY / HALL OF FAME ─────────────────────────
-// ══════════════════════════════════════════════════════════
-app.get('/api/leagues/:id/history', authMw, async (req, res) => {
-  try {
-    const { data, error } = await db.from('league_history')
-      .select('*').eq('league_id', req.params.id).order('ended_at', { ascending: false });
-    if (error) return res.status(500).json({ error: error.message });
-    res.json(data||[]);
-  } catch(e) { res.status(500).json({ error: e.message }); }
+// ── Settle weekly question ────────────────────────────────────
+async function settleWeeklyQuestion(qId, correctAnswer) {
+  const { data: picks } = await db.from('weekly_picks').select('*').eq('question_id', qId);
+  if (!picks?.length) return 0;
+  let settled = 0;
+  for (const p of picks) {
+    // For cleansheet: correct if pick matches ANY correct team
+    let isCorrect = false;
+    if (Array.isArray(correctAnswer)) { isCorrect = correctAnswer.includes(p.pick); }
+    else { isCorrect = p.pick === correctAnswer; }
+    const pts = isCorrect ? 10 : 0;
+    await db.from('weekly_picks').update({ correct: isCorrect, points: pts }).eq('id', p.id);
+    settled++;
+  }
+  await db.from('weekly_questions').update({ settled: true, correct_answer: Array.isArray(correctAnswer) ? correctAnswer.join(',') : correctAnswer }).eq('id', qId);
+  return settled;
+}
+
+// ── Generate weekly questions for next gameweek ───────────────
+async function generateWeeklyQuestions() {
+  const created = [];
+  for (const [code, lg] of Object.entries(LEAGUES)) {
+    try {
+      const { data: live } = await db.from('live_standings').select('gameweek,table_data').eq('id', `${code}_${SEASON}`).single();
+      const gw = (live?.gameweek || 0) + 1;
+      const qType = QUESTION_TYPES[(gw - 1) % QUESTION_TYPES.length];
+      const qId = `${code}_GW${gw}_${qType}`;
+      const { data: existing } = await db.from('weekly_questions').select('id').eq('id', qId).single();
+      if (existing) continue;
+      // Get next gameweek fixtures to set deadline
+      const fixtures = await fd(`/competitions/${code}/matches?matchday=${gw}&season=${SEASON}`);
+      const firstKickoff = fixtures?.matches?.[0]?.utcDate;
+      if (!firstKickoff) continue;
+      const deadline = new Date(firstKickoff);
+      deadline.setMinutes(deadline.getMinutes() - 5); // 5 min before first kick-off
+      // Build question text and options based on type
+      const teams = (live?.table_data || []).map(t => t.team);
+      const questions = {
+        topscorer: { question: `Who scores the most goals in ${lg.name} GW${gw}?`, options: [] },
+        assists:   { question: `Who gets the most assists in ${lg.name} GW${gw}?`, options: [] },
+        cleansheet:{ question: `Which team keeps a clean sheet in ${lg.name} GW${gw}?`, options: teams.map(t => ({ label: t, value: t })) },
+        cards:     { question: `Which team gets the most cards in ${lg.name} GW${gw}?`, options: teams.map(t => ({ label: t, value: t })) },
+        score:     { question: `Predict the score of the biggest ${lg.name} match in GW${gw}`, options: [] },
+        upset:     { question: `Which underdog wins in ${lg.name} GW${gw}?`, options: [] },
+      };
+      const q = questions[qType] || questions.cleansheet;
+      // For topscorer/assists, we'd need player data — use teams as fallback
+      if (qType === 'topscorer' || qType === 'assists') q.options = teams.map(t => ({ label: t, value: t }));
+      if (qType === 'score' || qType === 'upset') {
+        const matches = (fixtures?.matches || []).slice(0, 8).map(m => ({ label: `${m.homeTeam.name} vs ${m.awayTeam.name}`, value: m.id }));
+        q.options = matches;
+      }
+      await db.from('weekly_questions').insert({ id: qId, league_id: code, gameweek: gw, question_type: qType, question: q.question, options: q.options, deadline: deadline.toISOString() });
+      created.push(qId);
+    } catch(e) { console.warn('generateWeeklyQuestions error', code, e.message); }
+  }
+  return created;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ── TEAM PREDICTIONS ──────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+app.get('/api/team-fixtures/:team', authMw, rl(60), async (req, res) => {
+  const team = decodeURIComponent(req.params.team);
+  const now = new Date().toISOString();
+  // Get upcoming fixtures for this team
+  const { data: fixtures } = await db.from('fixtures')
+    .select('*')
+    .or(`home_team.eq.${team},away_team.eq.${team}`)
+    .gte('date', now.slice(0, 10))
+    .order('date').order('time').limit(10);
+  // Get user's existing predictions
+  const fids = (fixtures || []).map(f => f.id);
+  const { data: preds } = fids.length ? await db.from('team_predictions').select('*').eq('user_id', req.userId).in('fixture_id', fids) : { data: [] };
+  const predMap = new Map((preds || []).map(p => [p.fixture_id, p]));
+  res.json((fixtures || []).map(f => ({ ...f, prediction: predMap.get(f.id) || null })));
 });
 
-app.post('/api/leagues/:id/close-season', authMw, async (req, res) => {
-  const { season_name } = req.body;
-  if (!season_name) return res.status(400).json({ error: 'season_name required' });
-  try {
-    const { data: lg } = await db.from('leagues').select('owner_id').eq('id', req.params.id).single();
-    if (lg?.owner_id !== req.user.id) return res.status(403).json({ error: 'not your league' });
-    // Get current standings
-    const { data: members } = await db.from('league_members')
-      .select('user_id,points,profiles(username,avatar)').eq('league_id', req.params.id)
-      .order('points', { ascending: false }).limit(1);
-    const winner = members?.[0];
-    const { count } = await db.from('league_members').select('*',{count:'exact',head:true}).eq('league_id',req.params.id);
-    await db.from('league_history').insert({
-      league_id: req.params.id, season_name,
-      winner_id: winner?.user_id, winner_name: winner?.profiles?.username,
-      winner_pts: winner?.points||0, total_members: count||0
-    });
-    res.json({ ok: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+app.post('/api/team-prediction', authMw, rl(30), async (req, res) => {
+  const { fixture_id, team, pick, pred_home, pred_away } = req.body;
+  if (!['H','D','A'].includes(pick)) return res.status(400).json({ error: 'pick must be H, D or A' });
+  // Check kick-off time — must be > 1 minute from now
+  const { data: fix } = await db.from('fixtures').select('date,time,status').eq('id', fixture_id).single();
+  if (!fix) return res.status(404).json({ error: 'fixture not found' });
+  if (fix.status === 'FINISHED' || fix.status === 'IN_PLAY' || fix.status === 'PAUSED') return res.status(403).json({ error: 'Match already started' });
+  const kickoff = new Date(`${fix.date}T${fix.time || '12:00'}:00Z`);
+  if (kickoff - Date.now() < 60_000) return res.status(403).json({ error: 'Less than 1 minute to kick-off' });
+  const { data } = await db.from('team_predictions').upsert({
+    user_id: req.userId, fixture_id, team, league_id: fix.competition || '',
+    pick, pred_home: pred_home ?? null, pred_away: pred_away ?? null,
+    kickoff: kickoff.toISOString(), created_at: new Date().toISOString()
+  }, { onConflict: 'user_id,fixture_id' }).select().single();
+  res.json(data);
 });
 
-// ══════════════════════════════════════════════════════════
-// ── WEEKLY DIGEST ─────────────────────────────────────────
-// ══════════════════════════════════════════════════════════
-async function sendWeeklyDigest() {
-  if (!VAPID_PUBLIC || !VAPID_PRIVATE) return { sent: 0 };
-  const mon = new Date(); mon.setDate(mon.getDate() - ((mon.getDay() + 6) % 7)); mon.setHours(0,0,0,0);
-  const { data: preds } = await db.from('predictions')
-    .select('user_id,correct,points').eq('settled', true).gte('created_at', mon.toISOString());
+// ── Settle team predictions ───────────────────────────────────
+async function settleTeamPredictions() {
+  const { data: finished } = await db.from('fixtures')
+    .select('id,home_team,away_team,home_score,away_score,competition')
+    .eq('status', 'FINISHED').not('home_score', 'is', null);
+  if (!finished?.length) return 0;
+  const fids = finished.map(f => f.id);
+  const { data: unsettled } = await db.from('team_predictions').select('*').eq('settled', false).in('fixture_id', fids);
+  if (!unsettled?.length) return 0;
+  const fmap = new Map(finished.map(f => [f.id, f]));
+  let count = 0;
+  for (const p of unsettled) {
+    const fix = fmap.get(p.fixture_id); if (!fix) continue;
+    const result = fix.home_score > fix.away_score ? 'H' : fix.away_score > fix.home_score ? 'A' : 'D';
+    const correct = p.pick === result;
+    let pts = correct ? 3 : 0;
+    if (p.pred_home === fix.home_score && p.pred_away === fix.away_score) pts += 2;
+    await db.from('team_predictions').update({ correct, points: pts, settled: true, actual_home: fix.home_score, actual_away: fix.away_score }).eq('id', p.id);
+    count++;
+  }
+  return count;
+}
+
+// ── Fan leaderboard for a team ────────────────────────────────
+app.get('/api/fan-league/:team', rl(60), async (req, res) => {
+  const team = decodeURIComponent(req.params.team);
+  const { data } = await db.from('team_predictions')
+    .select('user_id,correct,points,profiles(username,avatar)')
+    .eq('team', team).eq('settled', true);
   const byUser = {};
-  (preds||[]).forEach(p => {
-    if (!byUser[p.user_id]) byUser[p.user_id] = { pts: 0, correct: 0, total: 0 };
-    byUser[p.user_id].pts += p.points||0;
+  for (const p of data || []) {
+    if (!byUser[p.user_id]) byUser[p.user_id] = { id: p.user_id, name: p.profiles?.username || '?', av: p.profiles?.avatar || 0, pts: 0, correct: 0, total: 0 };
+    byUser[p.user_id].pts += p.points || 0;
     byUser[p.user_id].total++;
     if (p.correct) byUser[p.user_id].correct++;
-  });
-  const uids = Object.keys(byUser);
-  if (!uids.length) return { sent: 0 };
-  const { data: subs } = await db.from('push_subscriptions').select('user_id,subscription').in('user_id', uids);
-  let sent = 0;
-  for (const sub of (subs||[])) {
-    const s = byUser[sub.user_id];
-    if (!s) continue;
-    const title = `⚽ Week recap — ${s.pts}pts earned`;
-    const body = `${s.correct}/${s.total} correct calls this week. Keep it up!`;
-    try {
-      await webpush.sendNotification(JSON.parse(sub.subscription), JSON.stringify({ title, body, url: '/' }));
-      sent++;
-    } catch(e) {
-      if (e.statusCode === 410) await db.from('push_subscriptions').delete().eq('user_id', sub.user_id);
-    }
   }
-  console.log(`Weekly digest sent to ${sent} users`);
-  return { sent };
+  const rows = Object.values(byUser).sort((a, b) => b.pts - a.pts).slice(0, 50);
+  rows.forEach((r, i) => r.rank = i + 1);
+  res.json(rows);
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ── PRIVATE LEAGUES ───────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+const code5 = () => Math.random().toString(36).slice(2, 7).toUpperCase();
+
+app.get('/api/leagues', authMw, async (req, res) => {
+  const { data: memberships } = await db.from('league_members').select('league_id').eq('user_id', req.userId);
+  if (!memberships?.length) return res.json([]);
+  const ids = memberships.map(m => m.league_id);
+  const { data } = await db.from('leagues').select('id,name,competition,emoji,code,is_public,league_members(count)').in('id', ids);
+  res.json(data || []);
+});
+
+app.post('/api/leagues', authMw, rl(10), async (req, res) => {
+  const { name, competition } = req.body;
+  const code = (competition || '').toUpperCase();
+  if (!LEAGUES[code]) return res.status(400).json({ error: 'Choose PL, PD or DED' });
+  if (!name?.trim()) return res.status(400).json({ error: 'League name required' });
+  const { data, error } = await db.from('leagues').insert({
+    owner_id: req.userId, name: String(name).slice(0, 40),
+    competition: code, code: code5(), is_public: false, emoji: LEAGUES[code].flag
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  await db.from('league_members').insert({ league_id: data.id, user_id: req.userId });
+  res.json(data);
+});
+
+app.post('/api/leagues/join', authMw, rl(20), async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ error: 'code required' });
+  const { data: lg } = await db.from('leagues').select('id,name').eq('code', code.toUpperCase()).single();
+  if (!lg) return res.status(404).json({ error: 'League not found' });
+  const { data: existing } = await db.from('league_members').select('id').eq('league_id', lg.id).eq('user_id', req.userId).single();
+  if (existing) return res.json({ ok: true, message: 'Already a member', league: lg });
+  await db.from('league_members').insert({ league_id: lg.id, user_id: req.userId });
+  res.json({ ok: true, league: lg });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ── CRON / SYNC ───────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+async function runSync() {
+  console.log('runSync start', new Date().toISOString());
+  const standings = await syncStandings();
+  const scores = {};
+  for (const code of Object.keys(LEAGUES)) {
+    scores[code] = await recalcLeagueScores(code);
+  }
+  const teamSettled = await settleTeamPredictions();
+  const questions = await generateWeeklyQuestions();
+  console.log('runSync done', { standings, scores, teamSettled, questions });
+  return { standings, scores, teamSettled, questions };
 }
 
-// Hook into cron — send digest on Mondays
-const _origCron = app._router?.stack?.find?.(r=>r?.route?.path==='/api/cron');
-app.get('/api/digest', async (req, res) => {
+app.get('/api/cron', async (req, res) => {
   const secret = req.headers['x-cron-secret'] || req.query.secret;
-  if (secret !== process.env.CRON_SECRET) return res.status(401).json({ error: 'unauthorized' });
-  const r = await sendWeeklyDigest();
-  res.json({ ok: true, ...r });
+  if (secret !== CRON_SECRET) return res.status(401).json({ error: 'unauthorized' });
+  try { const r = await runSync(); res.json({ ok: true, ...r }); }
+  catch(e) { console.error('cron error', e); res.status(500).json({ error: e.message }); }
 });
 
-// ════════ STRIPE PRO ════════
-app.post('/api/checkout', auth, async (req, res) => {
-  if (!stripe || !STRIPE_PRICE_ID) return res.status(503).json({ error: 'Payments are not set up yet.' });
-  const { data: profile } = await db.from('profiles').select('stripe_customer_id').eq('id', req.userId).single();
+app.get('/api/sync', async (req, res) => {
+  // Public sync endpoint (rate limited) — for manual trigger
+  try { const r = await syncStandings(); res.json({ ok: true, ...r }); }
+  catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ── STRIPE PRO ────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+app.post('/api/checkout', authMw, async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Payments not configured' });
+  const { data: prof } = await db.from('profiles').select('username').eq('id', req.userId).single();
   const session = await stripe.checkout.sessions.create({
-    mode: 'subscription', line_items: [{ price: STRIPE_PRICE_ID, quantity: 1 }],
-    customer: profile?.stripe_customer_id || undefined, client_reference_id: req.userId,
-    success_url: `${APP_URL}/?pro=success`, cancel_url: `${APP_URL}/?pro=cancel` });
+    mode: 'subscription', payment_method_types: ['card'],
+    line_items: [{ price: STRIPE_PRICE_ID, quantity: 1 }],
+    success_url: `${APP_URL}/app?pro=1`,
+    cancel_url: `${APP_URL}/app`,
+    metadata: { user_id: req.userId, username: prof?.username || '' }
+  });
   res.json({ url: session.url });
 });
-async function stripeWebhook(req, res) {
+
+app.post('/api/stripe/webhook', async (req, res) => {
   if (!stripe) return res.status(503).end();
   let event;
   try { event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET); }
-  catch (e) { return res.status(400).send(`bad signature: ${e.message}`); }
+  catch(e) { return res.status(400).send(`Webhook error: ${e.message}`); }
   if (event.type === 'checkout.session.completed') {
-    const s = event.data.object;
-    await db.from('profiles').update({ is_pro: true, stripe_customer_id: s.customer }).eq('id', s.client_reference_id);
-  }
-  if (event.type === 'customer.subscription.deleted') {
-    await db.from('profiles').update({ is_pro: false }).eq('stripe_customer_id', event.data.object.customer);
+    const { user_id } = event.data.object.metadata;
+    if (user_id) await db.from('profiles').update({ is_pro: true }).eq('id', user_id);
   }
   res.json({ received: true });
-}
+});
 
-app.listen(PORT, () => console.log(`Callazo API on :${PORT}`));
+// ═══════════════════════════════════════════════════════════════
+// ── START ─────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+app.listen(PORT, () => console.log(`Callazo v2 listening on ${PORT}`));
+setInterval(() => runSync().catch(e => console.warn('sync err', e.message)), 15 * 60_000);
 
-// Self-scheduled sync — no external cron needed (set SELF_SYNC=false to disable,
-// e.g. if you prefer the GitHub Action when running on a free tier that sleeps).
-if (process.env.SELF_SYNC !== 'false') {
-  const mins = Number(process.env.SYNC_MINUTES || 5);
-  setInterval(() => runSync().then(r => console.log('sync', r)).catch(e => console.warn('sync err', e.message)), mins * 60000);
-  runSync().then(r => console.log('initial sync', r)).catch(() => {});
-}
-
-/* ENV: FOOTBALL_DATA_TOKEN, SUPABASE_URL, SUPABASE_SERVICE_KEY, SUPABASE_JWT_SECRET,
-        STRIPE_SECRET, STRIPE_PRICE_ID, STRIPE_WEBHOOK_SECRET, CRON_SECRET, APP_URL */
