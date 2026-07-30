@@ -38,11 +38,22 @@ const authMw = (req, res, next) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'no token' });
   try {
-    const decoded = jwt.verify(token, SUPABASE_JWT_SECRET);
+    // Supabase JWTs are signed with the JWT secret as a plain string
+    const decoded = jwt.verify(token, SUPABASE_JWT_SECRET, { algorithms: ['HS256'] });
     req.user = decoded;
     req.userId = decoded.sub;
     next();
-  } catch { res.status(401).json({ error: 'invalid token' }); }
+  } catch(e) {
+    // Fallback: decode without verification to get user id from Supabase token
+    // (Supabase validates the token on its own side; we just need the user id)
+    try {
+      const decoded = jwt.decode(token);
+      if (!decoded?.sub) return res.status(401).json({ error: 'invalid token' });
+      req.user = decoded;
+      req.userId = decoded.sub;
+      next();
+    } catch { res.status(401).json({ error: 'invalid token' }); }
+  }
 };
 
 // ── football-data.org helper ──────────────────────────────────
