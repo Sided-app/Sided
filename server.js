@@ -466,7 +466,7 @@ app.get('/api/leagues', authMw, async (req, res) => {
   const { data: memberships } = await db.from('league_members').select('league_id').eq('user_id', req.userId);
   if (!memberships?.length) return res.json([]);
   const ids = memberships.map(m => m.league_id);
-  const { data } = await db.from('leagues').select('id,name,competition,emoji,code,is_public,league_members(count)').in('id', ids);
+  const { data } = await db.from('leagues').select('id,name,competition,code,league_members(count)').in('id', ids);
   res.json(data || []);
 });
 
