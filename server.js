@@ -250,9 +250,9 @@ function getDeadline(code) {
   // After gameweek 1 — set per league. Adjust these dates each season.
   // 2026/27 season — after GW1 weekend
   const deadlines = {
-    PL:  '2026-08-10T23:59:00Z',  // PL starts 8 Aug 2026
-    PD:  '2026-08-17T23:59:00Z',  // La Liga starts 15 Aug 2026
-    DED: '2026-08-03T23:59:00Z',  // Eredivisie starts 1 Aug 2026
+    DED: '2026-08-07T17:00:00Z',  // Aug 7, 19:00 Amsterdam (CEST = UTC+2)
+    PD:  '2026-08-15T17:00:00Z',  // Aug 15, 19:00 Amsterdam
+    PL:  '2026-08-21T17:00:00Z',  // Aug 21, 19:00 Amsterdam
   };
   return new Date(deadlines[code] || '2025-08-24T23:59:00Z');
 }
