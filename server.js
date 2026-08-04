@@ -125,20 +125,18 @@ app.get('/api/global-standings/:league', rl(120), async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit)||50, 200);
   const { data, error } = await db
     .from('table_predictions')
-    .select('user_id,score,bonus_champion,profiles(username,avatar)')
-    .eq('league_id', code)
-    .eq('season', SEASON)
-    .order('score', { ascending: false })
-    .limit(limit);
+    .select('user_id,score,bonus_champion')
+    .eq('league_id', code).eq('season', SEASON)
+    .order('score', { ascending: false }).limit(limit);
   if (error) return res.status(500).json({ error: error.message });
-  const rows = (data||[]).map((p,i) => ({
-    id: p.user_id,
-    name: p.profiles?.username || '?',
-    av: p.profiles?.avatar || 0,
-    score: p.score || 0,
-    champion: p.bonus_champion || null,
-    rank: i + 1
-  }));
+  if (!data?.length) return res.json([]);
+  const uids = data.map(p => p.user_id);
+  const { data: profs } = await db.from('profiles').select('id,username,avatar,followed_team').in('id', uids);
+  const profMap = new Map((profs||[]).map(p=>[p.id,p]));
+  const rows = data.map((p,i) => {
+    const prof = profMap.get(p.user_id) || {};
+    return { id: p.user_id, name: prof.username||'?', av: prof.avatar||'⚽', team: prof.followed_team||null, score: p.score||0, champion: p.bonus_champion||null, rank: i+1 };
+  });
   res.json(rows);
 });
 
@@ -261,18 +259,21 @@ function getDeadline(code) {
 app.get('/api/league-standings/:leagueId', authMw, async (req, res) => {
   const { leagueId } = req.params;
   const { data: members } = await db.from('league_members')
-    .select('user_id,profiles(username,avatar)').eq('league_id', leagueId);
+    .select('user_id').eq('league_id', leagueId);
   if (!members?.length) return res.json([]);
   const uids = members.map(m => m.user_id);
   const { data: lg } = await db.from('leagues').select('competition').eq('id', leagueId).single();
   const code = lg?.competition?.toUpperCase();
   const { data: preds } = await db.from('table_predictions')
-    .select('user_id,score,predicted_table,bonus_champion,submitted_at').eq('league_id', code).eq('season', SEASON).in('user_id', uids);
-  const predMap = new Map((preds || []).map(p => [p.user_id, p]));
+    .select('user_id,score,bonus_champion,submitted_at').eq('league_id', code).eq('season', SEASON).in('user_id', uids);
+  const { data: mprofs } = await db.from('profiles').select('id,username,avatar,followed_team').in('id', uids);
+  const mprofMap = new Map((mprofs||[]).map(p=>[p.id,p]));
+  const predMap = new Map((preds||[]).map(p=>[p.user_id,p]));
   const rows = members.map(m => {
     const p = predMap.get(m.user_id) || {};
-    return { id: m.user_id, name: m.profiles?.username || '?', av: m.profiles?.avatar || 0, score: p.score || 0, champion: p.bonus_champion || null, submitted: !!p.submitted_at };
-  }).sort((a, b) => b.score - a.score);
+    const prof = mprofMap.get(m.user_id) || {};
+    return { id: m.user_id, name: prof.username||'?', av: prof.avatar||'⚽', team: prof.followed_team||null, score: p.score||0, champion: p.bonus_champion||null, submitted: !!p.submitted_at };
+  }).sort((a,b) => b.score - a.score);
   res.json(rows);
 });
 
@@ -287,9 +288,13 @@ app.get('/api/table-compare/:league', authMw, async (req, res) => {
     if (!uids.includes(req.userId)) return res.status(403).json({ error: 'not a member' });
   } else { uids = [req.userId]; }
   const { data: preds } = await db.from('table_predictions')
-    .select('user_id,predicted_table,bonus_champion,score,profiles(username,avatar)')
+    .select('user_id,predicted_table,bonus_champion,score')
     .eq('league_id', code).eq('season', SEASON).in('user_id', uids);
-  res.json(preds || []);
+  if (!preds?.length) return res.json([]);
+  const cpuids = preds.map(p=>p.user_id);
+  const { data: cprofs } = await db.from('profiles').select('id,username,avatar').in('id', cpuids);
+  const cpmap = new Map((cprofs||[]).map(p=>[p.id,p]));
+  res.json(preds.map(p=>({...p, profiles: cpmap.get(p.user_id)||{}})));
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -442,12 +447,15 @@ async function settleTeamPredictions() {
 // ── Fan leaderboard for a team ────────────────────────────────
 app.get('/api/fan-league/:team', rl(60), async (req, res) => {
   const team = decodeURIComponent(req.params.team);
-  const { data } = await db.from('team_predictions')
-    .select('user_id,correct,points,profiles(username,avatar)')
-    .eq('team', team).eq('settled', true);
+  const { data: rawPreds } = await db.from('team_predictions')
+    .select('user_id,correct,points').eq('team', team).eq('settled', true);
+  const fanUids2=[...new Set((rawPreds||[]).map(p=>p.user_id))];
+  const { data: fp2 } = fanUids2.length ? await db.from('profiles').select('id,username,avatar').in('id',fanUids2) : {data:[]};
+  const fm2=new Map((fp2||[]).map(p=>[p.id,p]));
+  const data=(rawPreds||[]).map(p=>({...p,profiles:fm2.get(p.user_id)||{}}));
   const byUser = {};
   for (const p of data || []) {
-    if (!byUser[p.user_id]) byUser[p.user_id] = { id: p.user_id, name: p.profiles?.username || '?', av: p.profiles?.avatar || 0, pts: 0, correct: 0, total: 0 };
+    if (!byUser[p.user_id]) byUser[p.user_id] = { id: p.user_id, name: p.profiles?.username || '?', av: p.profiles?.avatar || '⚽', pts: 0, correct: 0, total: 0 };
     byUser[p.user_id].pts += p.points || 0;
     byUser[p.user_id].total++;
     if (p.correct) byUser[p.user_id].correct++;
