@@ -645,9 +645,9 @@ app.get('/api/user/:userId', authMw, async (req, res) => {
       .select('id').eq('follower_id', req.userId).eq('following_id', userId).single();
     // Follower counts
     const { count: followers } = await db.from('follows')
-      .select('*', { count: 'exact', head: true }).eq('following_id', userId);
+      .select('id', { count: 'exact', head: true }).eq('following_id', userId);
     const { count: following } = await db.from('follows')
-      .select('*', { count: 'exact', head: true }).eq('follower_id', userId);
+      .select('id', { count: 'exact', head: true }).eq('follower_id', userId);
     // Their table predictions (public)
     const { data: preds } = await db.from('table_predictions')
       .select('league_id,predicted_table,score,submitted_at')
@@ -671,16 +671,24 @@ app.delete('/api/follow/:userId', authMw, async (req, res) => {
 
 app.get('/api/following', authMw, async (req, res) => {
   const { data } = await db.from('follows')
-    .select('following_id,profiles!follows_following_id_fkey(id,username,avatar,followed_team)')
+    .select('following_id')
     .eq('follower_id', req.userId);
-  res.json((data||[]).map(f => f.profiles).filter(Boolean));
+  if (!data?.length) return res.json([]);
+  const ids = data.map(f => f.following_id);
+  const { data: profiles } = await db.from('profiles')
+    .select('id,username,avatar,followed_team').in('id', ids);
+  res.json(profiles||[]);
 });
 
 app.get('/api/followers', authMw, async (req, res) => {
   const { data } = await db.from('follows')
-    .select('follower_id,profiles!follows_follower_id_fkey(id,username,avatar,followed_team)')
+    .select('follower_id')
     .eq('following_id', req.userId);
-  res.json((data||[]).map(f => f.profiles).filter(Boolean));
+  if (!data?.length) return res.json([]);
+  const ids = data.map(f => f.follower_id);
+  const { data: profiles } = await db.from('profiles')
+    .select('id,username,avatar,followed_team').in('id', ids);
+  res.json(profiles||[]);
 });
 
 app.get('/api/search-users', authMw, rl(30), async (req, res) => {
