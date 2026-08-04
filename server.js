@@ -701,37 +701,6 @@ app.get('/api/search-users', authMw, rl(30), async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// ── CHAT ──────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════
-app.get('/api/chat/:channelId', authMw, rl(120), async (req, res) => {
-  const { channelId } = req.params;
-  const { data, error } = await db.from('chat_messages')
-    .select('id,user_id,message,created_at,profiles(username,avatar,followed_team)')
-    .eq('channel_id', channelId)
-    .order('created_at', { ascending: true })
-    .limit(100);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
-});
-
-app.post('/api/chat/:channelId', authMw, rl(30), async (req, res) => {
-  const { channelId } = req.params;
-  const { message } = req.body;
-  if (!message?.trim()) return res.status(400).json({ error: 'Message required' });
-  if (message.length > 500) return res.status(400).json({ error: 'Max 500 characters' });
-  // Validate channel: must be league_ or team_ prefixed
-  if (!channelId.startsWith('league_') && !channelId.startsWith('team_')) {
-    return res.status(400).json({ error: 'Invalid channel' });
-  }
-  const { data, error } = await db.from('chat_messages').insert({
-    channel_id: channelId, user_id: req.userId,
-    message: message.trim(), created_at: new Date().toISOString()
-  }).select('id,user_id,message,created_at,profiles(username,avatar,followed_team)').single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-// ═══════════════════════════════════════════════════════════════
 // ── STRIPE PRO ────────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/checkout', authMw, async (req, res) => {
