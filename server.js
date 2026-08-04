@@ -92,7 +92,7 @@ app.post('/api/profile', authMw, async (req, res) => {
   const { username, avatar, followed_leagues, followed_team } = req.body;
   const update = {};
   if (username) update.username = String(username).toLowerCase().slice(0, 20).replace(/[^a-z0-9_]/g, '');
-  if (avatar !== undefined) update.avatar = avatar;
+  if (avatar !== undefined) update.avatar = String(avatar); // emoji string
   if (followed_leagues) update.followed_leagues = followed_leagues;
   if (followed_team !== undefined) update.followed_team = followed_team;
   // Create or update profile
