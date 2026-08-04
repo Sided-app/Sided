@@ -495,6 +495,106 @@ app.post('/api/leagues/join', authMw, rl(20), async (req, res) => {
   res.json({ ok: true, league: lg });
 });
 
+
+// ── Prediction accuracy endpoint ──────────────────────────────
+app.get('/api/my-accuracy', authMw, async (req, res) => {
+  try {
+    const { data, error } = await db.from('team_predictions')
+      .select('correct,points,settled')
+      .eq('user_id', req.userId).eq('settled', true);
+    if (error) return res.status(500).json({ error: error.message });
+    const total = data?.length || 0;
+    const correct = data?.filter(p => p.correct).length || 0;
+    const pts = data?.reduce((s, p) => s + (p.points || 0), 0) || 0;
+    res.json({ total, correct, pts, accuracy: total ? Math.round(correct/total*100) : 0 });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Push notification subscription ───────────────────────────
+let webpush = null;
+try {
+  const wp = await import('web-push');
+  webpush = wp.default;
+  const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY;
+  const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY;
+  if (VAPID_PUBLIC && VAPID_PRIVATE) {
+    webpush.setVapidDetails('mailto:hello@callazo.com', VAPID_PUBLIC, VAPID_PRIVATE);
+    console.log('✓ Push notifications ready');
+  }
+} catch(e) { console.warn('web-push not installed:', e.message); }
+
+app.post('/api/push/subscribe', authMw, async (req, res) => {
+  const { subscription } = req.body;
+  if (!subscription) return res.status(400).json({ error: 'subscription required' });
+  await db.from('push_subscriptions').upsert({
+    user_id: req.userId, subscription: JSON.stringify(subscription), updated_at: new Date().toISOString()
+  }, { onConflict: 'user_id' });
+  res.json({ ok: true });
+});
+
+async function sendPush(userId, title, body, url='/') {
+  if (!webpush) return;
+  const { data: subs } = await db.from('push_subscriptions').select('subscription').eq('user_id', userId);
+  for (const s of (subs || [])) {
+    try {
+      await webpush.sendNotification(JSON.parse(s.subscription), JSON.stringify({ title, body, url }));
+    } catch(e) {
+      if (e.statusCode === 410) await db.from('push_subscriptions').delete().eq('user_id', userId);
+    }
+  }
+}
+
+// ── Weekly digest (call from cron on Mondays) ─────────────────
+async function sendWeeklyDigest() {
+  const { data: profiles } = await db.from('profiles').select('id,username,followed_leagues');
+  if (!profiles?.length) return 0;
+  let sent = 0;
+  for (const p of profiles) {
+    const leagues = p.followed_leagues || ['PL'];
+    const msgs = [];
+    for (const lg of leagues) {
+      const { data: pred } = await db.from('table_predictions')
+        .select('score').eq('user_id', p.id).eq('league_id', lg).eq('season', SEASON).single();
+      if (pred) msgs.push(`${LEAGUES[lg]?.name}: ${pred.score}pts`);
+    }
+    if (msgs.length) {
+      await sendPush(p.id, '⚽ Weekly update', msgs.join(' · '), '/');
+      sent++;
+    }
+  }
+  console.log('Weekly digest sent:', sent);
+  return sent;
+}
+
+// ── Deadline reminders (call from cron) ──────────────────────
+async function sendDeadlineReminders() {
+  const now = new Date();
+  const in24h = new Date(now.getTime() + 24 * 3600_000);
+  let sent = 0;
+  for (const [code, lg] of Object.entries(LEAGUES)) {
+    const deadline = getDeadline(code);
+    // Only send if deadline is in the next 24h
+    if (deadline > now && deadline <= in24h) {
+      // Find users who follow this league but haven't predicted
+      const { data: profiles } = await db.from('profiles')
+        .select('id').contains('followed_leagues', [code]);
+      const { data: existing } = await db.from('table_predictions')
+        .select('user_id').eq('league_id', code).eq('season', SEASON);
+      const doneIds = new Set((existing||[]).map(p=>p.user_id));
+      const notDone = (profiles||[]).filter(p=>!doneIds.has(p.id));
+      for (const p of notDone) {
+        await sendPush(p.id,
+          `⏰ ${lg.name} deadline in 24h!`,
+          'Submit your table prediction before the deadline.',
+          '/');
+        sent++;
+      }
+    }
+  }
+  console.log('Deadline reminders sent:', sent);
+  return sent;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // ── CRON / SYNC ───────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════
@@ -507,8 +607,12 @@ async function runSync() {
   }
   const teamSettled = await settleTeamPredictions();
   const questions = await generateWeeklyQuestions();
-  console.log('runSync done', { standings, scores, teamSettled, questions });
-  return { standings, scores, teamSettled, questions };
+  // Weekly digest on Mondays, deadline reminders daily
+  const dayOfWeek = new Date().getDay();
+  if (dayOfWeek === 1) await sendWeeklyDigest();
+  const reminders = await sendDeadlineReminders();
+  console.log('runSync done', { standings, scores, teamSettled, questions, reminders });
+  return { standings, scores, teamSettled, questions, reminders };
 }
 
 app.get('/api/cron', async (req, res) => {
@@ -522,6 +626,101 @@ app.get('/api/sync', async (req, res) => {
   // Public sync endpoint (rate limited) — for manual trigger
   try { const r = await syncStandings(); res.json({ ok: true, ...r }); }
   catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+
+
+// ═══════════════════════════════════════════════════════════════
+// ── FOLLOW SYSTEM ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+app.get('/api/user/:userId', authMw, async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const { data: profile } = await db.from('profiles')
+      .select('id,username,avatar,followed_team,followed_leagues,is_pro')
+      .eq('id', userId).single();
+    if (!profile) return res.status(404).json({ error: 'User not found' });
+    // Is the requesting user following this person?
+    const { data: follow } = await db.from('follows')
+      .select('id').eq('follower_id', req.userId).eq('following_id', userId).single();
+    // Follower counts
+    const { count: followers } = await db.from('follows')
+      .select('*', { count: 'exact', head: true }).eq('following_id', userId);
+    const { count: following } = await db.from('follows')
+      .select('*', { count: 'exact', head: true }).eq('follower_id', userId);
+    // Their table predictions (public)
+    const { data: preds } = await db.from('table_predictions')
+      .select('league_id,predicted_table,score,submitted_at')
+      .eq('user_id', userId).eq('season', SEASON);
+    res.json({ ...profile, isFollowing: !!follow, followers: followers||0, following: following||0, predictions: preds||[] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/follow/:userId', authMw, rl(30), async (req, res) => {
+  const { userId } = req.params;
+  if (userId === req.userId) return res.status(400).json({ error: "Can't follow yourself" });
+  const { error } = await db.from('follows').insert({ follower_id: req.userId, following_id: userId });
+  if (error && !error.message.includes('duplicate')) return res.status(500).json({ error: error.message });
+  res.json({ ok: true, following: true });
+});
+
+app.delete('/api/follow/:userId', authMw, async (req, res) => {
+  await db.from('follows').delete().eq('follower_id', req.userId).eq('following_id', req.params.userId);
+  res.json({ ok: true, following: false });
+});
+
+app.get('/api/following', authMw, async (req, res) => {
+  const { data } = await db.from('follows')
+    .select('following_id,profiles!follows_following_id_fkey(id,username,avatar,followed_team)')
+    .eq('follower_id', req.userId);
+  res.json((data||[]).map(f => f.profiles).filter(Boolean));
+});
+
+app.get('/api/followers', authMw, async (req, res) => {
+  const { data } = await db.from('follows')
+    .select('follower_id,profiles!follows_follower_id_fkey(id,username,avatar,followed_team)')
+    .eq('following_id', req.userId);
+  res.json((data||[]).map(f => f.profiles).filter(Boolean));
+});
+
+app.get('/api/search-users', authMw, rl(30), async (req, res) => {
+  const q = (req.query.q||'').toLowerCase().slice(0,20);
+  if (q.length < 2) return res.json([]);
+  const { data } = await db.from('profiles')
+    .select('id,username,avatar,followed_team')
+    .ilike('username', `%${q}%`).neq('id', req.userId).limit(20);
+  res.json(data||[]);
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ── CHAT ──────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+app.get('/api/chat/:channelId', authMw, rl(120), async (req, res) => {
+  const { channelId } = req.params;
+  const { data, error } = await db.from('chat_messages')
+    .select('id,user_id,message,created_at,profiles(username,avatar,followed_team)')
+    .eq('channel_id', channelId)
+    .order('created_at', { ascending: true })
+    .limit(100);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+app.post('/api/chat/:channelId', authMw, rl(30), async (req, res) => {
+  const { channelId } = req.params;
+  const { message } = req.body;
+  if (!message?.trim()) return res.status(400).json({ error: 'Message required' });
+  if (message.length > 500) return res.status(400).json({ error: 'Max 500 characters' });
+  // Validate channel: must be league_ or team_ prefixed
+  if (!channelId.startsWith('league_') && !channelId.startsWith('team_')) {
+    return res.status(400).json({ error: 'Invalid channel' });
+  }
+  const { data, error } = await db.from('chat_messages').insert({
+    channel_id: channelId, user_id: req.userId,
+    message: message.trim(), created_at: new Date().toISOString()
+  }).select('id,user_id,message,created_at,profiles(username,avatar,followed_team)').single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 });
 
 // ═══════════════════════════════════════════════════════════════
