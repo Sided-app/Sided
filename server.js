@@ -72,7 +72,7 @@ const LEAGUES = {
   DED: { name: 'Eredivisie',     code: 'DED', teams: 18, relegated: 2, ucl: 2, flag: '🇳🇱' },
 };
 const SEASON = '2026';
-const QUESTION_TYPES = ['topscorer','assists','cleansheet','cards','score','upset'];
+const QUESTION_TYPES = ['mostgoals','cleansheet','biggestwin','cards','score','upset'];
 
 // ═══════════════════════════════════════════════════════════════
 // ── HEALTH ────────────────────────────────────────────────────
@@ -141,6 +141,29 @@ app.get('/api/global-standings/:league', rl(120), async (req, res) => {
 });
 
 // ── Sync standings from football-data.org ─────────────────────
+
+// ── Fallback star players per league (pre-season seed) ────────
+const STAR_PLAYERS = {
+  PL: ['Erling Haaland','Mohamed Salah','Cole Palmer','Bukayo Saka',
+       'Alexander Isak','Ollie Watkins','Dominic Solanke','Jarrod Bowen',
+       'Richarlison','Bryan Mbeumo'],
+  PD: ['Robert Lewandowski','Vinicius Jr','Kylian Mbappé','Antoine Griezmann',
+       'Iker Bravo','Ante Budimir','Borja Iglesias','Mikel Oyarzabal',
+       'Samu Omorodion','Lamine Yamal'],
+  DED: ['Luuk de Jong','Brian Brobbey','Couhaib Driouech','Christos Retsos',
+        'Vangelis Pavlidis','Noni Madueke','David Moberg Karlsson',
+        'Jens Toornstra','Million Manhoef','Yorbe Vertessen'],
+};
+
+async function getTopScorers(code, season) {
+  try {
+    const data = await fd(`/competitions/${code}/scorers?season=${season}&limit=10`);
+    const players = (data.scorers || []).map(s => s.player.name).filter(Boolean);
+    if (players.length >= 5) return players.slice(0, 10);
+  } catch(e) { console.warn('scorers API failed:', e.message); }
+  return STAR_PLAYERS[code] || [];
+}
+
 async function syncStandings() {
   const results = {};
   for (const [code, lg] of Object.entries(LEAGUES)) {
@@ -363,13 +386,15 @@ async function generateWeeklyQuestions() {
       deadline.setMinutes(deadline.getMinutes() - 5); // 5 min before first kick-off
       // Build question text and options based on type
       const teams = (live?.table_data || []).map(t => t.team);
+      const teamOpts = teams.map(t => ({ label: t, value: t }));
+      const matchOpts = (fixtures?.matches || []).slice(0, 8).map(m => ({ label: `${m.homeTeam?.shortName||m.homeTeam?.name} vs ${m.awayTeam?.shortName||m.awayTeam?.name}`, value: `${m.homeTeam?.name}|${m.awayTeam?.name}` }));
       const questions = {
-        topscorer: { question: `Who scores the most goals in ${lg.name} GW${gw}?`, options: [] },
-        assists:   { question: `Who gets the most assists in ${lg.name} GW${gw}?`, options: [] },
-        cleansheet:{ question: `Which team keeps a clean sheet in ${lg.name} GW${gw}?`, options: teams.map(t => ({ label: t, value: t })) },
-        cards:     { question: `Which team gets the most cards in ${lg.name} GW${gw}?`, options: teams.map(t => ({ label: t, value: t })) },
-        score:     { question: `Predict the score of the biggest ${lg.name} match in GW${gw}`, options: [] },
-        upset:     { question: `Which underdog wins in ${lg.name} GW${gw}?`, options: [] },
+        mostgoals:  { question: `Which team scores the most goals in ${lg.name} GW${gw}?`, options: teamOpts },
+        cleansheet: { question: `Which team keeps a clean sheet in ${lg.name} GW${gw}?`, options: teamOpts },
+        biggestwin: { question: `Which team wins by the biggest margin in ${lg.name} GW${gw}?`, options: teamOpts },
+        cards:      { question: `Which team gets the most cards in ${lg.name} GW${gw}?`, options: teamOpts },
+        score:      { question: `Predict the score of the biggest ${lg.name} match in GW${gw}`, options: matchOpts.slice(0,1) },
+        upset:      { question: `Which team pulls off the biggest upset in ${lg.name} GW${gw}?`, options: teamOpts },
       };
       const q = questions[qType] || questions.cleansheet;
       // For topscorer/assists, we'd need player data — use teams as fallback
@@ -706,6 +731,34 @@ app.get('/api/search-users', authMw, rl(30), async (req, res) => {
     .select('id,username,avatar,followed_team')
     .ilike('username', `%${q}%`).neq('id', req.userId).limit(20);
   res.json(data||[]);
+});
+
+
+// ── Weekly pick streak ────────────────────────────────────────
+app.get('/api/my-streak', authMw, async (req, res) => {
+  try {
+    const { data } = await db.from('weekly_picks')
+      .select('correct,picked_at,question_id')
+      .eq('user_id', req.userId)
+      .eq('correct', true)
+      .order('picked_at', { ascending: false })
+      .limit(50);
+    // Get all settled picks ordered by date to calculate streak
+    const { data: all } = await db.from('weekly_picks')
+      .select('correct,picked_at')
+      .eq('user_id', req.userId)
+      .not('correct', 'is', null)
+      .order('picked_at', { ascending: false })
+      .limit(50);
+    let streak = 0;
+    for (const p of (all||[])) {
+      if (p.correct) streak++;
+      else break;
+    }
+    const total = (all||[]).length;
+    const correct = (all||[]).filter(p=>p.correct).length;
+    res.json({ streak, total, correct, accuracy: total ? Math.round(correct/total*100) : 0 });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ═══════════════════════════════════════════════════════════════
