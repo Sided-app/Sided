@@ -164,6 +164,36 @@ async function getTopScorers(code, season) {
   return STAR_PLAYERS[code] || [];
 }
 
+
+// ── Team name normalisation (live API → our canonical names) ──
+const TEAM_NAME_MAP = {
+  "Nottingham Forest FC":"Nottingham Forest",
+  "Manchester City FC":"Manchester City","Manchester United FC":"Manchester United",
+  "Arsenal FC":"Arsenal","Chelsea FC":"Chelsea","Liverpool FC":"Liverpool",
+  "Tottenham Hotspur FC":"Tottenham Hotspur","Newcastle United FC":"Newcastle United",
+  "Aston Villa FC":"Aston Villa","Everton FC":"Everton","Fulham FC":"Fulham",
+  "Brentford FC":"Brentford","Crystal Palace FC":"Crystal Palace",
+  "Brighton & Hove Albion FC":"Brighton & Hove Albion",
+  "Ipswich Town FC":"Ipswich Town","Coventry City FC":"Coventry City",
+  "Sunderland AFC":"Sunderland","Leeds United FC":"Leeds United","Hull City AFC":"Hull City",
+  "FC Barcelona":"Barcelona","Real Madrid CF":"Real Madrid",
+  "Atletico de Madrid":"Atlético Madrid","Atlético de Madrid":"Atlético Madrid",
+  "Club Atletico de Madrid":"Atlético Madrid",
+  "Athletic Club de Bilbao":"Athletic Club","Real Betis Balompie":"Real Betis",
+  "Sevilla FC":"Sevilla","Villarreal CF":"Villarreal",
+  "Real Sociedad de Futbol":"Real Sociedad","Deportivo Alaves":"Alavés",
+  "RC Celta de Vigo":"Celta Vigo","Getafe CF":"Getafe",
+  "Rayo Vallecano de Madrid":"Rayo Vallecano","CA Osasuna":"Osasuna",
+  "RC Deportivo de La Coruna":"Deportivo La Coruña","Elche CF":"Elche",
+  "Levante UD":"Levante","Malaga CF":"Málaga",
+  "Racing de Santander":"Racing Santander","Valencia CF":"Valencia","RCD Espanyol":"Espanyol",
+  "AFC Ajax":"Ajax Amsterdam","AZ Alkmaar":"AZ Alkmaar",
+  "PSV Eindhoven":"PSV Eindhoven","Feyenoord Rotterdam":"Feyenoord Rotterdam",
+  "sc Heerenveen":"Heerenveen","SC Heerenveen":"Heerenveen",
+  "SBV Excelsior":"Excelsior","Excelsior Rotterdam":"Excelsior",
+};
+const normTeam = n => TEAM_NAME_MAP[n] || n;
+
 async function syncStandings() {
   const results = {};
   for (const [code, lg] of Object.entries(LEAGUES)) {
@@ -171,7 +201,7 @@ async function syncStandings() {
       const data = await fd(`/competitions/${code}/standings?season=${SEASON}`);
       const table = (data.standings?.[0]?.table || []).map(row => ({
         position: row.position,
-        team: row.team.name,
+        team: normTeam(row.team.name),
         shortName: row.team.shortName || row.team.tla,
         crest: row.team.crest,
         played: row.playedGames,
