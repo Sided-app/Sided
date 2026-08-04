@@ -191,6 +191,17 @@ const TEAM_NAME_MAP = {
   "PSV Eindhoven":"PSV Eindhoven","Feyenoord Rotterdam":"Feyenoord Rotterdam",
   "sc Heerenveen":"Heerenveen","SC Heerenveen":"Heerenveen",
   "SBV Excelsior":"Excelsior","Excelsior Rotterdam":"Excelsior",
+  "AZ":"AZ","AZ Alkmaar":"AZ",
+  "NEC":"NEC","NEC Nijmegen":"NEC",
+  "Ajax":"Ajax","AFC Ajax":"Ajax",
+  "Feyenoord":"Feyenoord","Feyenoord Rotterdam":"Feyenoord",
+  "PSV":"PSV","PSV Eindhoven":"PSV",
+  "Telstar 1963":"Telstar",
+  "Willem II Tilburg":"Willem II",
+  "Twente '65":"Twente","Twente 65":"Twente","FC Twente":"Twente","FC Twente Enschede":"Twente",
+  "RCD Espanyol de Barcelona":"Espanyol","RCD Espanyol":"Espanyol",
+  "Racing Club de Santander":"Racing Santander","Real Racing Club de Santander":"Racing Santander",
+  "SC Cambuur":"Cambuur","Cambuur":"Cambuur","SC Cambuur Leeuwarden":"Cambuur",
 };
 const normTeam = n => TEAM_NAME_MAP[n] || n;
 
