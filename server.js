@@ -312,7 +312,7 @@ function getDeadline(code) {
   // After gameweek 1 — set per league. Adjust these dates each season.
   // 2026/27 season — after GW1 weekend
   const deadlines = {
-    DED: '2026-08-07T17:00:00Z',  // Aug 7, 19:00 Amsterdam (CEST = UTC+2)
+    DED: '2026-08-14T17:00:00Z',  // Aug 14, 19:00 Amsterdam (CEST = UTC+2)
     PD:  '2026-08-15T17:00:00Z',  // Aug 15, 19:00 Amsterdam
     PL:  '2026-08-21T17:00:00Z',  // Aug 21, 19:00 Amsterdam
   };
@@ -705,6 +705,32 @@ app.get('/api/sync', async (req, res) => {
 
 
 // ═══════════════════════════════════════════════════════════════
+
+// ── Suggested users to follow ─────────────────────────────────
+app.get('/api/suggested-users', authMw, rl(30), async (req, res) => {
+  try {
+    // Get current user's leagues
+    const { data: me } = await db.from('profiles')
+      .select('followed_leagues').eq('id', req.userId).single();
+    const myLeagues = me?.followed_leagues || ['PL'];
+    // Get users I already follow
+    const { data: following } = await db.from('follows')
+      .select('following_id').eq('follower_id', req.userId);
+    const followingIds = new Set((following||[]).map(f=>f.following_id));
+    followingIds.add(req.userId); // exclude self
+    // Find users who follow same leagues, ordered by most recent
+    const { data: candidates } = await db.from('profiles')
+      .select('id,username,avatar,followed_team,followed_leagues,created_at')
+      .overlaps('followed_leagues', myLeagues)
+      .order('created_at', { ascending: false })
+      .limit(30);
+    const suggestions = (candidates||[])
+      .filter(u => !followingIds.has(u.id))
+      .slice(0, 10);
+    res.json(suggestions);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── FOLLOW SYSTEM ─────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════
 app.get('/api/user/:userId', authMw, async (req, res) => {
