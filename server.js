@@ -205,6 +205,50 @@ const TEAM_NAME_MAP = {
 };
 const normTeam = n => TEAM_NAME_MAP[n] || n;
 
+
+async function syncFixtures() {
+  let total = 0;
+  for (const [code] of Object.entries(LEAGUES)) {
+    try {
+      const data = await fd(`/competitions/${code}/matches?season=${SEASON}&matchday=1`);
+      const matches = data.matches || [];
+      // Also fetch next 5 matchdays
+      const { data: live } = await db.from('live_standings')
+        .select('gameweek').eq('id', `${code}_${SEASON}`).single();
+      const gw = live?.gameweek || 1;
+      // Fetch current + next matchday
+      for (const day of [gw, gw+1]) {
+        const d2 = await fd(`/competitions/${code}/matches?season=${SEASON}&matchday=${day}`);
+        matches.push(...(d2.matches||[]));
+      }
+      // Dedupe by id
+      const seen = new Set();
+      const unique = matches.filter(m => { if(seen.has(m.id))return false; seen.add(m.id); return true; });
+      for (const m of unique) {
+        const utcDate = m.utcDate || '';
+        const datePart = utcDate.slice(0,10);          // "2026-08-08"
+        const timePart = utcDate.slice(11,16);         // "14:00"
+        await db.from('fixtures').upsert({
+          id: m.id,
+          competition: code,
+          home_team: normTeam(m.homeTeam?.name || ''),
+          away_team: normTeam(m.awayTeam?.name || ''),
+          date: datePart,
+          time: timePart,
+          status: m.status || 'SCHEDULED',
+          home_score: m.score?.fullTime?.home ?? null,
+          away_score: m.score?.fullTime?.away ?? null,
+          matchday: m.matchday || gw,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'id' });
+        total++;
+      }
+    } catch(e) { console.warn('syncFixtures error', code, e.message); }
+  }
+  console.log(`syncFixtures: ${total} fixtures upserted`);
+  return total;
+}
+
 async function syncStandings() {
   const results = {};
   for (const [code, lg] of Object.entries(LEAGUES)) {
@@ -414,11 +458,13 @@ async function generateWeeklyQuestions() {
   for (const [code, lg] of Object.entries(LEAGUES)) {
     try {
       const { data: live } = await db.from('live_standings').select('gameweek,table_data').eq('id', `${code}_${SEASON}`).single();
-      const gw = (live?.gameweek || 0) + 1;
-      const qType = QUESTION_TYPES[(gw - 1) % QUESTION_TYPES.length];
-      const qId = `${code}_GW${gw}_${qType}`;
-      const { data: existing } = await db.from('weekly_questions').select('id').eq('id', qId).single();
-      if (existing) continue;
+      const currentGw = live?.gameweek || 1;
+      // Generate for current GW first if missing, then next GW
+      for (const gw of [currentGw, currentGw + 1]) {
+        const qType = QUESTION_TYPES[(gw - 1) % QUESTION_TYPES.length];
+        const qId = `${code}_GW${gw}_${qType}`;
+        const { data: existing } = await db.from('weekly_questions').select('id').eq('id', qId).single();
+        if (existing) continue;
       // Get next gameweek fixtures to set deadline
       const fixtures = await fd(`/competitions/${code}/matches?matchday=${gw}&season=${SEASON}`);
       const firstKickoff = fixtures?.matches?.[0]?.utcDate;
@@ -445,7 +491,8 @@ async function generateWeeklyQuestions() {
         q.options = matches;
       }
       await db.from('weekly_questions').insert({ id: qId, league_id: code, gameweek: gw, question_type: qType, question: q.question, options: q.options, deadline: deadline.toISOString() });
-      created.push(qId);
+        created.push(qId);
+      } // end gw loop
     } catch(e) { console.warn('generateWeeklyQuestions error', code, e.message); }
   }
   return created;
@@ -455,14 +502,16 @@ async function generateWeeklyQuestions() {
 // ── TEAM PREDICTIONS ──────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════
 app.get('/api/team-fixtures/:team', authMw, rl(60), async (req, res) => {
-  const team = decodeURIComponent(req.params.team);
-  const now = new Date().toISOString();
-  // Get upcoming fixtures for this team
+  const rawTeam = decodeURIComponent(req.params.team);
+  const team = normTeam(rawTeam); // normalise in case profile has old name
+  const now = new Date().toISOString().slice(0,10);
+  // Get upcoming + recent fixtures for this team
+  const sevenDaysAgo = new Date(Date.now()-7*864e5).toISOString().slice(0,10);
   const { data: fixtures } = await db.from('fixtures')
     .select('*')
     .or(`home_team.eq.${team},away_team.eq.${team}`)
-    .gte('date', now.slice(0, 10))
-    .order('date').order('time').limit(10);
+    .gte('date', sevenDaysAgo)
+    .order('date').order('time').limit(15);
   // Get user's existing predictions
   const fids = (fixtures || []).map(f => f.id);
   const { data: preds } = fids.length ? await db.from('team_predictions').select('*').eq('user_id', req.userId).in('fixture_id', fids) : { data: [] };
@@ -675,6 +724,7 @@ async function sendDeadlineReminders() {
 async function runSync() {
   console.log('runSync start', new Date().toISOString());
   const standings = await syncStandings();
+  const fixtures = await syncFixtures().catch(e=>{console.warn('fixture sync err',e.message);return 0;});
   const scores = {};
   for (const code of Object.keys(LEAGUES)) {
     scores[code] = await recalcLeagueScores(code);
@@ -697,9 +747,11 @@ app.get('/api/cron', async (req, res) => {
 });
 
 app.get('/api/sync', async (req, res) => {
-  // Public sync endpoint (rate limited) — for manual trigger
-  try { const r = await syncStandings(); res.json({ ok: true, ...r }); }
-  catch(e) { res.status(500).json({ error: e.message }); }
+  try {
+    const standings = await syncStandings();
+    const fixtures = await syncFixtures().catch(e=>({error:e.message}));
+    res.json({ ok: true, standings, fixtures });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 
@@ -728,6 +780,29 @@ app.get('/api/suggested-users', authMw, rl(30), async (req, res) => {
       .filter(u => !followingIds.has(u.id))
       .slice(0, 10);
     res.json(suggestions);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+
+// ── Compare two users' table predictions directly ────────────
+app.get('/api/compare-users', authMw, async (req, res) => {
+  const { user2, league } = req.query;
+  if (!user2 || !league) return res.status(400).json({ error: 'user2 and league required' });
+  const code = league.toUpperCase();
+  try {
+    const uids = [req.userId, user2];
+    const { data: preds } = await db.from('table_predictions')
+      .select('user_id,predicted_table,score,submitted_at')
+      .eq('league_id', code).eq('season', SEASON).in('user_id', uids);
+    const { data: profs } = await db.from('profiles')
+      .select('id,username,avatar,followed_team').in('id', uids);
+    const profMap = new Map((profs||[]).map(p=>[p.id,p]));
+    const result = uids.map(uid => ({
+      user_id: uid,
+      ...(preds||[]).find(p=>p.user_id===uid)||{},
+      profile: profMap.get(uid)||{}
+    }));
+    res.json(result);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
